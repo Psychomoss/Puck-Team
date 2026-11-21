@@ -1,0 +1,7 @@
+datasets/
+target/
+generator/target/
+out*/
+*.zip
+.venv/
+perf.data*
