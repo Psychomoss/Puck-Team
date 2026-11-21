@@ -1,9 +1,7 @@
 # Results: Shopping Sessions in C++ (team puck)
 
-The pipeline is C++20 (GCC, one static binary, zstd for the Parquet pages; no Arrow). It started from
-the MIT-licensed C++ entry [mliao0128/fraun-shopping-sessions](https://github.com/mliao0128/fraun-shopping-sessions)
-(see `LICENSE`) and was rebuilt around the design of our earlier Rust pipeline (branch `rust-final`),
-whose techniques had measured about 2x less CPU on the same data.
+The pipeline is C++20 (GCC, one static binary, zstd for the Parquet pages; no Arrow), built around
+the design of our earlier Rust pipeline (branch `rust-final`).
 
 All times are on the development laptop (Intel Core Ultra 5 228V: 4 P-cores + 4 low-power E-cores, no
 hyperthreading, no AVX-512), through Docker with the scorer's flags (`scripts/docker_run.sh`,
@@ -12,12 +10,12 @@ overhead on this machine. The scorer has 8 vCPUs that are hyperthreads of ~4 phy
 
 ## Wall time (Docker, 3 runs each, interleaved)
 
-| dataset | reference C++ entry | this pipeline |
+| dataset | first C++ version | this pipeline |
 |---|---|---|
 | practice-like (seed 7, 20M events) | 1.98, 1.88, 1.82 s | **1.14, 1.16, 1.10 s** |
 | final-like (seed 11, 60M events) | 4.87, 4.86, 4.81 s | **2.66, 2.71, 2.66 s** |
 
-Native whole-process wall (interleaved medians): practice 1561 ms (reference) -> 835 ms; our Rust
+Native whole-process wall (interleaved medians): practice 1561 ms (first C++ version) -> 835 ms; our Rust
 pipeline is 797 ms on the same runs, final 2338 ms (Rust) vs 2373 ms (C++).
 
 ## Stage breakdown (inside the container, one run, ms; CPU ms summed over threads)
