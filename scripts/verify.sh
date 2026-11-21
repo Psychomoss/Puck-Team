@@ -3,15 +3,16 @@
 #   DOCKER=1  run the image via scripts/docker_run.sh (scorer flags) instead of the native binary
 #   QUICK=1   skip the 1-thread and reversed-file-order runs
 cd "$(dirname "$0")/.."
-export PATH="$HOME/.cargo/bin:$PWD/.venv/bin:$PATH"
+export PATH="$PWD/.venv/bin:$PATH"
+# Native builds use build.sh; set ZSTD_CFLAGS / ZSTD_LIBS if zstd is not installed system-wide.
 fail=0
 check() { if "$@" >/dev/null; then echo "  ok: $*"; else echo "  FAILED: $*"; fail=1; fi; }
-BIN=target/release/sessions
+BIN=build/sessions
 if [ "${DOCKER:-0}" = 1 ]; then
   run() { rm -rf "$2"; scripts/docker_run.sh "$1" "$2" 2>/dev/null; }
   fixture_cmd=scripts/docker_run.sh
 else
-  cargo build --release -q || { echo FAIL; exit 1; }
+  ./build.sh || { echo FAIL; exit 1; }
   run() { rm -rf "$2"; DATA_DIR="$1" OUTPUT_DIR="$2" "$BIN" 2>/dev/null; }
   fixture_cmd=$BIN
 fi

@@ -1,6 +1,6 @@
 # PROGRESS
 
-Team puck, Shopping Sessions, Rust. Read this and `git log` first when resuming.
+Team puck, Shopping Sessions, C++ (Rust until Phase 5; that code is on branch `rust-final`). Read this and `git log` first when resuming.
 
 ## Status
 - Phase 0 (setup): done.
@@ -119,4 +119,27 @@ Notes from experiments:
 Result (native wall, interleaved, median): practice 834 -> 779-803 ms, final 2421 -> 2377 ms (min 2413 -> 2297);
 total CPU practice 5.95 -> 5.35 s. Docker (laptop, incl. ~0.4 s container overhead): practice ~1.11 s, final ~2.7 s.
 Notes: in-process "total" hides exit cost (mmap teardown ~60 ms at practice); compare whole-process wall.
+
+## Phase 6 (2026-11-21): switch to C++
+Requested: take the C++ entry mliao0128/fraun-shopping-sessions (MIT, LICENSE kept) as the base and improve it.
+Its unmodified code passed every check here, but used 8.6 s CPU at practice (ours 5.35 s): 16-byte keys
+and records, a serial union-find, std::sort per person, Arrow writer, and ~0.1 s of exit teardown.
+Rebuilt it around the Rust design (ported module by module: parse.hpp/.cpp, links.cpp, person.cpp,
+main.cpp, then our own parquet.cpp replacing Arrow). Native whole-process wall, interleaved medians:
+
+| # | change | practice | final | kept |
+|---|---|---|---|---|
+| 0 | reference C++ as is (+ zstd output, _exit) | 1561 ms | 4.7 s | - |
+| 1 | C++ port of the Rust pipeline (glibc malloc) | 1046 ms | | yes |
+| 2 | GLIBC_TUNABLES=glibc.malloc.hugetlb=1 (THP for malloc; links sys 335 -> 83 ms) | 949 ms | | yes |
+| 3 | pack16 via pshufb nibble lookups (GCC rebuilt ~10 broadcast constants per call): keys 13.2 -> 7.1 ns per 2 | 912 ms | | yes |
+| 4 | always_inline on the hot parse path; clang-16 build; mimalloc (plain / large OS pages) | 916 / 891 / 943 / 929 ms | | no |
+| 5 | huge-page link tables, uninitialized radix and scan buffers | ~equal | | yes (fewer faults) |
+| 6 | own Parquet writer (PLAIN pages + zstd, Thrift compact metadata), static binary, no Arrow | 836 ms | | yes |
+| 7 | session scratch presized for the largest bucket on huge pages (faults 27K -> 7.5K) | 835 ms | 2373 ms | yes |
+
+Rust on the same runs: 797 ms / 2338 ms. Docker (laptop): practice 1.88 s (reference image) -> 1.14 s,
+final 4.85 s -> 2.66 s. Tests: `tests/test.cpp` (build with `g++ -std=c++20 -O2 -march=x86-64-v3
+-fsanitize=address,undefined -Isrc tests/test.cpp src/parse.cpp`), plus `scripts/verify.sh`.
+Local native build without zstd headers: `ZSTD_CFLAGS=-I<zstd lib dir> ZSTD_LIBS=-l:libzstd.so.1 ./build.sh`.
 
