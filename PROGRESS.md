@@ -7,6 +7,8 @@ Team puck, Shopping Sessions, Rust. Read this and `git log` first when resuming.
 - Phase 1 (correct Rust pipeline): done. Gate 1 passed.
 - Phase 2 (Docker): done. Multi-stage (rust:1.95-slim-bookworm -> debian:bookworm-slim, needs `chmod` for
   docker_run.sh cleanup), mimalloc, fat LTO, x86-64-v3. Docker: fixtures 36/36, dev MATCH (0.53 s wall incl. container start).
+- Phase 4 (final check + report): done. Fresh no-cache image build, fixtures 36/36, dev MATCH, verify.sh
+  PASS through Docker and natively (incl. 1-thread and reversed order). TEAM.md and RESULTS.md written.
 - Phase 3 (performance): done (see log; stopped after 7 consecutive <2% ideas). `scripts/bench.sh` = docker median of 3 (CPUS=8 MEM=24g) + verify.sh.
   `perf` is unavailable (perf_event_paranoid=2, no root), so profiling uses stage timers + micro-benchmarks.
 
@@ -40,6 +42,8 @@ Also in `scripts/golden.sha256` (used by verify.sh).
   byte order); longer strings go through a global interner (never hit by generator data; unit-tested).
 - Category `unknown` is added to the sorted category list, so index order == byte order for ties.
 - Session day = floor(start / 1 day) as Date32; campaign arrays indexed by day relative to window start.
+
+## Final timings (Docker median of 3, laptop): dev 0.39 s, practice 1.13 s, final 2.81 s
 
 ## Timings (native, laptop, 8 threads, v1)
 | dataset | total |

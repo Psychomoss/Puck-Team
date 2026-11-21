@@ -1,5 +1,5 @@
 # Team
 
-Name:
-Members:
-Engine: DuckDB
+Name: puck
+Members: Seyran Umudov
+Engine: Rust
