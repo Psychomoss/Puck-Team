@@ -58,6 +58,7 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | 3 | pread into per-thread buffers instead of mmap; append-only block lists (1024-record blocks) for all bucket stores instead of over-reserved Vecs; per-stage user/sys CPU in timings. Peak RSS final 15 GB -> 5.7 GB | 1.24 s | 3.22 s | yes |
 | 4 | SIMD timestamps (F3: right-aligned 16-digit maddubs/madd; F1/F2: two 16-byte compares + shuffle), `Line` API keeping the chunk buffer so ID packing (6-bit, SSE) and F3 parsing read 16 bytes in-bounds without copies; differential tests vs scalar references | 1.21 s | 3.02 s | yes |
 | 5 | Parquet: no dictionary, no statistics, Int32 counts, rows split into equal 256K-row files written by the work-stealing pool; person stage: assists in a separate u32 campaign x day array (112 KB, L2-resident), credited counters 16 B, single pass for gap+revenue, skip category argmax without purchases | 1.10 s | 2.76 s | yes |
+| 6 | Compact records: events 40 -> 32 B (ts u32 relative to window start, u32::MAX = invalid; purchases as handles into per-thread price/category side tables), person-bucket events 24 -> 16 B, clicks 32 -> 24 B | 1.14 s | 2.82 s | yes (A/B native interleaved, 7 runs: final 2588 -> 2539 ms, practice 1048 -> 888 ms median; docker runs noisy) |
 
 Notes from experiments:
 - split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
@@ -72,4 +73,8 @@ Notes from experiments:
 - Radix digit width in person stage: 11 bits best (8: +70 ms, 10: +35 ms at final).
 - Final has 10.0M sessions, 58.8M surviving events, 2.0M persons, 6.6M user rows, 104M assist pairs.
 - Regression caught by fixtures: zero user rows must still produce one (empty) parquet file.
-- Limitation: window (+7 days) must be < 2^40 ms (34 years) for the packed sort key; asserted at startup. purge_delay=-1: ~250 ms gain at final (less page faulting).
+- Limitation: window (+7 days) must be < 2^32 ms (49 days) for the u32 relative timestamps; asserted at startup
+  (the generator always uses 14 days). Threads are clamped to 62 (purchase handles use 6 bits of thread id).
+- Laptop timing noise is large (thermal + background VM): docker final varied 2.70-2.97 s for one binary.
+  `scripts/ab.sh BIN_A BIN_B DATASET RUNS` interleaves two native binaries; used for keep/revert decisions.
+- Prefetch distance 8/16/32/64 for person lookups: within noise; using 32. purge_delay=-1: ~250 ms gain at final (less page faulting).

@@ -138,6 +138,7 @@ pub fn process(
     ctx: &Ctx,
     evs: &[&[PEv]],
     cls: &[&[PCl]],
+    sides: &[Vec<u64>],
     s: &mut Scratch,
     ncamp: usize,
     ncat: usize,
@@ -156,7 +157,14 @@ pub fn process(
     for v in evs {
         for e in v.iter() {
             let pid = ids.insert(e.pkey) as u64;
-            s.se.push(SE { key: pid << ctx.ev_bits | (e.ts - ctx.ws) as u64, price: e.price, cat: e.cat });
+            let (mut price, mut cat) = (0, 0);
+            if e.pc != 0 {
+                let h = e.pc - 1;
+                let v = sides[(h >> 26) as usize][(h & ((1 << 26) - 1)) as usize];
+                price = v as u32;
+                cat = (v >> 32) as u32;
+            }
+            s.se.push(SE { key: pid << ctx.ev_bits | e.ts as u64, price, cat });
         }
     }
     let pid_bits = bits_for(ids.keys.len() as u64);
@@ -166,7 +174,7 @@ pub fn process(
         for c in v.iter() {
             let (_, t) = ids.find(c.pkey);
             if t != u32::MAX {
-                s.sc.push(SC { key: (t as u64) << ctx.cl_bits | (c.ts - ctx.cws) as u64, ckey: c.ckey, camp: c.camp });
+                s.sc.push(SC { key: (t as u64) << ctx.cl_bits | c.ts as u64, ckey: c.ckey, camp: c.camp });
             }
         }
     }

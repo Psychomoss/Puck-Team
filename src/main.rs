@@ -157,29 +157,28 @@ fn read_small_csv<const N: usize>(path: &Path, mut f: impl FnMut(&[&[u8]; N])) {
 }
 
 #[derive(Clone, Copy)]
+/// One parsed event copy. `ts` is relative to window_start (u32::MAX = invalid copy); `pc` is a
+/// purchase handle into the parse threads' side tables (0 = not a purchase).
 struct Ev {
     ekey: u64,
     ukey: u64,
     ingest: i64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    valid: u16,
+    ts: u32,
+    pc: u32,
 }
 
 #[derive(Clone, Copy)]
 pub struct PEv {
     pub pkey: u64,
-    pub ts: i64,
-    pub price: u32,
-    pub cat: u32,
+    pub ts: u32,
+    pub pc: u32,
 }
 
 #[derive(Clone, Copy)]
 pub struct PCl {
     pub pkey: u64,
     pub ckey: u64,
-    pub ts: i64,
+    pub ts: u32,
     pub camp: u32,
 }
 
@@ -292,7 +291,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
-        .max(1);
+        .clamp(1, 62);
     let reverse = std::env::var("REVERSE_FILES").is_ok_and(|v| v == "1");
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap();
@@ -327,46 +326,58 @@ fn main() {
 
     // Events: parse, validate each copy, bucket by event_id.
     let ev_in = open_input(&data.join("events"), reverse);
-    let ev_parts: Vec<Vec<BlockVec<Ev>>> = par_tasks(
+    assert!(we - ws < u32::MAX as i64 && we - (ws - WEEK) < u32::MAX as i64, "window longer than 49 days");
+    let tids = AtomicUsize::new(0);
+    let ev_parts: Vec<(Vec<BlockVec<Ev>>, Vec<u8>, usize, Vec<u64>)> = par_tasks(
         ev_in.len(),
         threads,
-        || (buckets::<Ev>(), Vec::new()),
-        |(bk, buf), i| {
+        || (buckets::<Ev>(), Vec::new(), tids.fetch_add(1, Relaxed), Vec::<u64>::new()),
+        |(bk, buf, tid, side), i| {
             scan::<7>(ev_in.read(i, buf), |f| {
                 if f.is_empty(0) {
                     return;
                 }
                 let ekey = f.key(0);
                 let ingest = f.ts(3).unwrap_or(i64::MAX);
-                let mut e = Ev { ekey, ukey: 0, ingest, ts: 0, price: 0, cat: 0, valid: 0 };
-                let ok = (|| {
+                let mut e = Ev { ekey, ukey: 0, ingest, ts: u32::MAX, pc: 0 };
+                (|| {
                     if f.is_empty(1) || f.is_empty(5) {
                         return None;
                     }
                     let ts = f.ts(2).filter(|&t| t >= ws && t < we)?;
+                    let mut purchase = None;
                     match f.get(4) {
                         b"view" | b"cart" => {}
                         b"purchase" => {
-                            e.price = parse_price(f.get(6))?;
-                            e.cat = products.get(f.get(5)).map_or(unknown, |c| c as u16);
+                            let price = parse_price(f.get(6))?;
+                            let cat = products.get(f.get(5)).unwrap_or(unknown as u32);
+                            purchase = Some(price as u64 | (cat as u64) << 32);
                         }
                         _ => return None,
                     }
                     if ingest - ts > DAY {
                         return None;
                     }
-                    e.ts = ts;
+                    if let Some(v) = purchase {
+                        e.pc = ((*tid as u32) << 26 | side.len() as u32) + 1;
+                        side.push(v);
+                    }
+                    e.ts = (ts - ws) as u32;
                     e.ukey = f.key(1);
                     Some(())
                 })();
-                e.valid = ok.is_some() as u16;
                 bk[bucket(ekey)].push(e);
             });
         },
-    )
-    .into_iter()
-    .map(|x| x.0)
-    .collect();
+    );
+    let mut sides: Vec<Vec<u64>> = (0..ev_parts.len()).map(|_| Vec::new()).collect();
+    let ev_parts: Vec<Vec<BlockVec<Ev>>> = ev_parts
+        .into_iter()
+        .map(|(b, _, tid, side)| {
+            sides[tid] = side;
+            b
+        })
+        .collect();
     tm.lap("events parse");
 
     // Dedup per bucket (smallest ingest_ts wins), keep valid survivors, re-bucket by person.
@@ -404,10 +415,10 @@ fn main() {
                         if tkeys[h] == e.ekey {
                             let (pt, pi) = ((s >> 24) as usize, (s & 0xFF_FFFF) as usize);
                             if e.ingest < parts[pt][pi].ingest {
-                                parts[pt][pi].valid = 0;
+                                parts[pt][pi].ts = u32::MAX;
                                 table[h] = (t as u32) << 24 | i as u32;
                             } else {
-                                parts[t][i].valid = 0;
+                                parts[t][i].ts = u32::MAX;
                             }
                             break;
                         }
@@ -417,12 +428,12 @@ fn main() {
             }
             for p in parts.iter().flat_map(|p| p.blocks()) {
                 for (i, e) in p.iter().enumerate() {
-                    if let Some(f) = p.get(i + 16) {
+                    if let Some(f) = p.get(i + 32) {
                         persons.prefetch(f.ukey);
                     }
-                    if e.valid != 0 {
+                    if e.ts != u32::MAX {
                         let pk = persons.get(e.ukey);
-                        out[bucket(pk)].push(PEv { pkey: pk, ts: e.ts, price: e.price, cat: e.cat as u32 });
+                        out[bucket(pk)].push(PEv { pkey: pk, ts: e.ts, pc: e.pc });
                     }
                 }
             }
@@ -450,10 +461,10 @@ fn main() {
                 }
                 let Some(ts) = f.ts(3).filter(|&t| t >= cws && t < we) else { return };
                 let Some(camp) = campaigns.get(f.get(2)) else { return };
-                tmp.push(PCl { pkey: f.key(1), ckey: f.key(0), ts, camp });
+                tmp.push(PCl { pkey: f.key(1), ckey: f.key(0), ts: (ts - cws) as u32, camp });
             });
             for j in 0..tmp.len() {
-                if let Some(n) = tmp.get(j + 16) {
+                if let Some(n) = tmp.get(j + 32) {
                     persons.prefetch(n.pkey);
                 }
                 let mut c = tmp[j];
@@ -482,7 +493,7 @@ fn main() {
             let b = order[oi];
             let evs: Vec<&[PEv]> = pev_parts.iter().flat_map(|t| t[b].blocks()).collect();
             let cls: Vec<&[PCl]> = pcl_parts.iter().flat_map(|t| t[b].blocks()).collect();
-            person::process(&ctx, &evs, &cls, scratch, ncamp, ncat, rows, cr, asst);
+            person::process(&ctx, &evs, &cls, &sides, scratch, ncamp, ncat, rows, cr, asst);
         },
     );
     tm.lap("sessions");
