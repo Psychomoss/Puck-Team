@@ -7,7 +7,7 @@ Team puck, Shopping Sessions, Rust. Read this and `git log` first when resuming.
 - Phase 1 (correct Rust pipeline): done. Gate 1 passed.
 - Phase 2 (Docker): done. Multi-stage (rust:1.95-slim-bookworm -> debian:bookworm-slim, needs `chmod` for
   docker_run.sh cleanup), mimalloc, fat LTO, x86-64-v3. Docker: fixtures 36/36, dev MATCH (0.53 s wall incl. container start).
-- Phase 3 (performance): in progress. `scripts/bench.sh` = docker median of 3 (CPUS=8 MEM=24g) + verify.sh.
+- Phase 3 (performance): done (see log; stopped after 7 consecutive <2% ideas). `scripts/bench.sh` = docker median of 3 (CPUS=8 MEM=24g) + verify.sh.
   `perf` is unavailable (perf_event_paranoid=2, no root), so profiling uses stage timers + micro-benchmarks.
 
 ## How to check
@@ -63,6 +63,11 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | 8 | dedup table as one array of (key, idx) 16 B slots | - | dedup 510 -> 590 ms | no |
 | 9 | dedup table with 8 B slots (32-bit fingerprint + idx) | - | no change | no |
 | 10 | L3-sized bitmap filter in front of the person table (skip DRAM lookup for IDs that need no remap; 61% of lookups hit linked IDs) | - | dedup 510 -> 610 ms (unpredictable branch; prefetch already hides latency) | no |
+| 11 | person stage: counting sort by person + insertion/pdq sort per person instead of LSD radix | - | sessions 440 -> 480 ms | no |
+| 12 | software write-combining (2 records per bucket) + non-temporal 64 B stores into aligned event blocks | - | parse 985 -> 1035 ms, dedup slower (reads now miss cache) | no |
+| 13 | partitioned join for ID -> person (route by user ID, links emit partitioned remaps, per-bucket resolve pass with cache-resident tables) | +2% | -2% | no (mixed; more code/memory; resolve pass costs ~220 ms at final vs ~270 ms of lookups saved) |
+
+Phase 3 stopped: seven consecutive ideas (8-13 plus prefetch distance) each under 2%.
 
 Notes from experiments:
 - split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
@@ -82,4 +87,6 @@ Notes from experiments:
 - Laptop timing noise is large (thermal + background VM): docker final varied 2.70-2.97 s for one binary.
   `scripts/ab.sh BIN_A BIN_B DATASET RUNS` interleaves two native binaries; used for keep/revert decisions.
 - Docker no-op container with scorer flags: ~0.25 s fixed overhead on this laptop.
+- In-pipeline cost of the 1024-way event scatter at final: ~200 ms of 1020 ms parse (0.4 s sys page faults).
+- Remaining random person lookups cost ~230 ms at final (dedup ~190, clicks ~40), hidden mostly by prefetch.
 - Prefetch distance 8/16/32/64 for person lookups: within noise; using 32. purge_delay=-1: ~250 ms gain at final (less page faulting).
