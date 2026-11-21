@@ -153,7 +153,7 @@ fn open_input(dir: &Path, reverse: bool) -> Input {
 fn read_small_csv<const N: usize>(path: &Path, mut f: impl FnMut(&[&[u8]; N])) {
     let data = std::fs::read(path).unwrap_or_default();
     let Some(h) = memchr(b'\n', &data) else { return };
-    scan::<N>(&data[h + 1..], |fl| f(fl));
+    scan::<N>(&data[h + 1..], |l| f(&std::array::from_fn(|i| l.get(i))));
 }
 
 #[derive(Clone, Copy)]
@@ -333,22 +333,22 @@ fn main() {
         || (buckets::<Ev>(), Vec::new()),
         |(bk, buf), i| {
             scan::<7>(ev_in.read(i, buf), |f| {
-                if f[0].is_empty() {
+                if f.is_empty(0) {
                     return;
                 }
-                let ekey = key(f[0]);
-                let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                let ekey = f.key(0);
+                let ingest = f.ts(3).unwrap_or(i64::MAX);
                 let mut e = Ev { ekey, ukey: 0, ingest, ts: 0, price: 0, cat: 0, valid: 0 };
                 let ok = (|| {
-                    if f[1].is_empty() || f[5].is_empty() {
+                    if f.is_empty(1) || f.is_empty(5) {
                         return None;
                     }
-                    let ts = parse_ts(f[2]).filter(|&t| t >= ws && t < we)?;
-                    match f[4] {
+                    let ts = f.ts(2).filter(|&t| t >= ws && t < we)?;
+                    match f.get(4) {
                         b"view" | b"cart" => {}
                         b"purchase" => {
-                            e.price = parse_price(f[6])?;
-                            e.cat = products.get(f[5]).map_or(unknown, |c| c as u16);
+                            e.price = parse_price(f.get(6))?;
+                            e.cat = products.get(f.get(5)).map_or(unknown, |c| c as u16);
                         }
                         _ => return None,
                     }
@@ -356,7 +356,7 @@ fn main() {
                         return None;
                     }
                     e.ts = ts;
-                    e.ukey = key(f[1]);
+                    e.ukey = f.key(1);
                     Some(())
                 })();
                 e.valid = ok.is_some() as u16;
@@ -445,12 +445,12 @@ fn main() {
         |(bk, tmp, buf), i| {
             tmp.clear();
             scan::<4>(cl_in.read(i, buf), |f| {
-                if f[0].is_empty() || f[1].is_empty() {
+                if f.is_empty(0) || f.is_empty(1) {
                     return;
                 }
-                let Some(ts) = parse_ts(f[3]).filter(|&t| t >= cws && t < we) else { return };
-                let Some(camp) = campaigns.get(f[2]) else { return };
-                tmp.push(PCl { pkey: key(f[1]), ckey: key(f[0]), ts, camp });
+                let Some(ts) = f.ts(3).filter(|&t| t >= cws && t < we) else { return };
+                let Some(camp) = campaigns.get(f.get(2)) else { return };
+                tmp.push(PCl { pkey: f.key(1), ckey: f.key(0), ts, camp });
             });
             for j in 0..tmp.len() {
                 if let Some(n) = tmp.get(j + 16) {

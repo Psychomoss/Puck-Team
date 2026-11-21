@@ -1,4 +1,4 @@
-use crate::parse::{ANY_INTERNED, cmp_key, key, mix, scan};
+use crate::parse::{ANY_INTERNED, cmp_key, mix, scan};
 use crate::{Input, SendPtr, Timer, par_tasks};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -64,8 +64,8 @@ const STEP: usize = 1 << 16;
 pub fn build(input: &Input, threads: usize, tm: &mut Timer) -> Persons {
     let pairs: Vec<Vec<[u64; 2]>> = par_tasks(input.len(), threads, || (Vec::new(), Vec::new()), |(v, buf), i| {
         scan::<2>(input.read(i, buf), |f| {
-            if !f[0].is_empty() && !f[1].is_empty() {
-                v.push([key(f[0]), key(f[1])]);
+            if !f.is_empty(0) && !f.is_empty(1) {
+                v.push([f.key(0), f.key(1)]);
             }
         });
     })

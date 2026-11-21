@@ -40,10 +40,48 @@ fn masks(data: &[u8], base: usize) -> (u64, u64, u64) {
     }
 }
 
-/// Calls `f` with the N fields of every well-formed line of `data` (rules' dialect: only `\n`
+/// One well-formed line: field i is `data[st[i]..en[i]]` (quotes already stripped). Keeping
+/// `data` lets the parsers read 16 bytes past a field without leaving the buffer.
+pub struct Line<'a, const N: usize> {
+    data: &'a [u8],
+    st: [usize; N],
+    en: [usize; N],
+}
+
+impl<'a, const N: usize> Line<'a, N> {
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> &'a [u8] {
+        unsafe { self.data.get_unchecked(self.st[i]..self.en[i]) }
+    }
+    #[inline(always)]
+    pub fn is_empty(&self, i: usize) -> bool {
+        self.st[i] == self.en[i]
+    }
+    #[inline(always)]
+    pub fn key(&self, i: usize) -> u64 {
+        let (s, e) = (self.st[i], self.en[i]);
+        if e - s <= 10 && s + 16 <= self.data.len() {
+            if let Some(k) = unsafe { pack16(self.data.as_ptr().add(s), e - s) } {
+                return k;
+            }
+        }
+        key(self.get(i))
+    }
+    #[inline(always)]
+    pub fn ts(&self, i: usize) -> Option<i64> {
+        let (s, e) = (self.st[i], self.en[i]);
+        let l = e - s;
+        if l > 0 && l <= 16 && e >= 16 && !(l == 20 || l == 25) {
+            return unsafe { digits_end(self.data.as_ptr().add(e - 16), l) }.map(|v| v as i64);
+        }
+        parse_ts(self.get(i))
+    }
+}
+
+/// Calls `f` with every well-formed line of `data` that has N fields (rules' dialect: only `\n`
 /// ends a line, quotes only around a whole field and stripped). Malformed lines are skipped.
 #[inline(always)]
-pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
+pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&Line<N>)) {
     let len = data.len();
     let mut ls = 0usize;
     let mut nf = 0usize;
@@ -52,7 +90,7 @@ pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
     let mut base = 0usize;
     // Branch-free field splitting: which fields are quoted is random, so branches would mispredict.
     let mut emit = |ls: usize, ends: &[usize; 8], mut q: u32| {
-        let mut fl = [&b""[..]; N];
+        let mut line = Line { data, st: [0; N], en: [0; N] };
         let mut s = ls;
         for i in 0..N {
             let e = ends[i];
@@ -61,11 +99,12 @@ pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
             let last = *data.get(e.wrapping_sub(1)).unwrap_or(&0);
             let st = ((first == b'"') & (last == b'"') & (l >= 2)) as usize;
             q = q.wrapping_sub(2 * st as u32);
-            fl[i] = unsafe { data.get_unchecked(s + st..e - st) };
+            line.st[i] = s + st;
+            line.en[i] = e - st;
             s = e + 1;
         }
         if q == 0 {
-            f(&fl);
+            f(&line);
         }
     };
     while base < len {
@@ -99,6 +138,68 @@ pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
     }
 }
 
+/// 6-bit packing of `l` (<= 10) bytes at p, reading 16 bytes; None if a byte is outside [0-9A-Z_a-z].
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn pack16(p: *const u8, l: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let inlen = _mm_cmpgt_epi8(_mm_set1_epi8(l as i8), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+        let range = |lo: u8, hi: u8| _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(lo as i8 - 1)), _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), v));
+        let dig = range(b'0', b'9');
+        let up = range(b'A', b'Z');
+        let us = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+        let lo = range(b'a', b'z');
+        let valid = _mm_or_si128(_mm_or_si128(dig, up), _mm_or_si128(us, lo));
+        if _mm_movemask_epi8(_mm_andnot_si128(valid, inlen)) != 0 {
+            return None;
+        }
+        let off = _mm_or_si128(
+            _mm_or_si128(_mm_and_si128(dig, _mm_set1_epi8(47)), _mm_and_si128(up, _mm_set1_epi8(54))),
+            _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(58)), _mm_and_si128(lo, _mm_set1_epi8(59))),
+        );
+        let code = _mm_and_si128(_mm_sub_epi8(v, off), inlen);
+        let m1 = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
+        let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_1000));
+        let q0 = _mm_cvtsi128_si32(m2) as u32 as u64;
+        let q1 = _mm_extract_epi32(m2, 1) as u32 as u64;
+        let q2 = _mm_extract_epi32(m2, 2) as u32 as u64;
+        Some(q0 << 36 | q1 << 12 | q2 >> 12)
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+unsafe fn pack16(p: *const u8, l: usize) -> Option<u64> {
+    pack(unsafe { std::slice::from_raw_parts(p, l) })
+}
+
+/// Digits-only value of the `l` (<= 16) bytes ending at p + 16, reading 16 bytes from p.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn digits_end(p: *const u8, l: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let keep = _mm_cmpgt_epi8(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm_set1_epi8(15 - l as i8));
+        let d = _mm_and_si128(_mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8)), keep);
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+            return None;
+        }
+        let m1 = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+        let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_0064));
+        let m3 = _mm_packus_epi32(m2, m2);
+        let m4 = _mm_madd_epi16(m3, _mm_set1_epi32(0x0001_2710));
+        let r = _mm_cvtsi128_si64(m4) as u64;
+        Some((r & 0xFFFF_FFFF) * 100_000_000 + (r >> 32))
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+unsafe fn digits_end(p: *const u8, l: usize) -> Option<u64> {
+    digits16(unsafe { std::slice::from_raw_parts(p.add(16 - l), l) })
+}
+
 #[inline(always)]
 fn dg(c: u8) -> u32 {
     c.wrapping_sub(b'0') as u32
@@ -120,9 +221,143 @@ pub fn days_from_civil(y: u32, m: u32, d: u32) -> i64 {
 #[inline]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
     let l = s.len();
+    if (l == 20 || l == 25) && s[4] == b'-' {
+        return iso(s);
+    }
+    if l == 0 {
+        return None;
+    }
+    if l <= 16 {
+        return digits16(s).map(|v| v as i64);
+    }
+    let mut v: i64 = 0;
+    for &c in s {
+        let d = dg(c);
+        if d >= 10 {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add(d as i64)?;
+    }
+    Some(v)
+}
+
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn digits16(s: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let mut b = [b'0'; 16];
+    b[16 - s.len()..].copy_from_slice(s);
+    unsafe {
+        let d = _mm_sub_epi8(_mm_loadu_si128(b.as_ptr() as *const __m128i), _mm_set1_epi8(b'0' as i8));
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) != 0xFFFF {
+            return None;
+        }
+        let m1 = _mm_maddubs_epi16(d, _mm_set1_epi16(0x010A));
+        let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_0064));
+        let m3 = _mm_packus_epi32(m2, m2);
+        let m4 = _mm_madd_epi16(m3, _mm_set1_epi32(0x0001_2710));
+        let r = _mm_cvtsi128_si64(m4) as u64;
+        Some((r & 0xFFFF_FFFF) * 100_000_000 + (r >> 32))
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+fn digits16(s: &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for &c in s {
+        let d = dg(c);
+        if d >= 10 {
+            return None;
+        }
+        v = v * 10 + d as u64;
+    }
+    Some(v)
+}
+
+#[inline(always)]
+fn civil_ms(y: u32, mo: u32, d: u32, h: u32, mi: u32, se: u32) -> Option<i64> {
+    if mo.wrapping_sub(1) >= 12 || d == 0 || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let dim = match mo {
+        2 => 28 + leap as u32,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if d > dim {
+        return None;
+    }
+    Some((days_from_civil(y, mo, d) * 86_400 + (h * 3600 + mi * 60 + se) as i64) * 1000)
+}
+
+/// F1 (20 bytes) or F2 (25 bytes): every fixed character and digit checked with two 16-byte compares.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn iso(s: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let f2 = s.len() == 25;
+    unsafe {
+        let v0 = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        let v1 = _mm_loadu_si128(s.as_ptr().add(s.len() - 16) as *const __m128i);
+        let z = _mm_set1_epi8(b'0' as i8);
+        let nine = _mm_set1_epi8(9);
+        let d0 = _mm_sub_epi8(v0, z);
+        let d1 = _mm_sub_epi8(v1, z);
+        let dig0 = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d0, nine), d0)) as u32;
+        let dig1 = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d1, nine), d1)) as u32;
+        const P0: [u8; 16] = *b"0000-00-00T00:00";
+        let p0 = _mm_movemask_epi8(_mm_cmpeq_epi8(v0, _mm_loadu_si128(P0.as_ptr() as *const __m128i))) as u32;
+        // lanes: digits 0-3,5,6,8,9,11,12,14,15; fixed 4,7,10,13
+        if dig0 & 0xDB6F != 0xDB6F || p0 & 0x2490 != 0x2490 {
+            return None;
+        }
+        let (sec_at, off) = if !f2 {
+            // v1 = s[4..20]: ':' lane 12, digits 13,14, 'Z' lane 15
+            if dig1 & 0x6000 != 0x6000 || s[16] != b':' || s[19] != b'Z' {
+                return None;
+            }
+            (17, 0i64)
+        } else {
+            // v1 = s[9..25]: ':' lane 7, digits 8,9, sign 10, digits 11,12, ':' 13, digits 14,15
+            if dig1 & 0xDB00 != 0xDB00 || s[16] != b':' || s[22] != b':' {
+                return None;
+            }
+            let sign = match s[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let oh = dg(s[20]) * 10 + dg(s[21]);
+            let om = dg(s[23]) * 10 + dg(s[24]);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            (17, sign * (oh * 60 + om) as i64 * 60_000)
+        };
+        let pairs = _mm_shuffle_epi8(d0, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+        let m = _mm_maddubs_epi16(pairs, _mm_set1_epi16(0x010A));
+        let mut w = [0u16; 8];
+        _mm_storeu_si128(w.as_mut_ptr() as *mut __m128i, m);
+        let se = dg(s[sec_at]) * 10 + dg(s[sec_at + 1]);
+        let y = w[0] as u32 * 100 + w[1] as u32;
+        Some(civil_ms(y, w[2] as u32, w[3] as u32, w[4] as u32, w[5] as u32, se)? - off)
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+fn iso(s: &[u8]) -> Option<i64> {
+    parse_iso_ref(s)
+}
+
+/// Epoch ms for F1/F2/F3; None for any bad form. An F3 overflowing i64 is None too (it is
+/// outside every window anyway).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_ts_ref(s: &[u8]) -> Option<i64> {
+    let l = s.len();
     if l == 20 || l == 25 {
         if s[4] == b'-' {
-            return parse_iso(s);
+            return parse_iso_ref(s);
         }
     }
     if l == 0 {
@@ -149,8 +384,7 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
-#[inline]
-fn parse_iso(s: &[u8]) -> Option<i64> {
+fn parse_iso_ref(s: &[u8]) -> Option<i64> {
     let ds = [dg(s[0]), dg(s[1]), dg(s[2]), dg(s[3]), dg(s[5]), dg(s[6]), dg(s[8]), dg(s[9]), dg(s[11]), dg(s[12]), dg(s[14]), dg(s[15]), dg(s[17]), dg(s[18])];
     let mut bad = (s[7] != b'-') | (s[10] != b'T') | (s[13] != b':') | (s[16] != b':');
     for d in ds {
@@ -345,7 +579,7 @@ mod tests {
 
     fn split<const N: usize>(line: &[u8]) -> Option<Vec<Vec<u8>>> {
         let mut out = None;
-        scan::<N>(line, |f| out = Some(f.iter().map(|x| x.to_vec()).collect()));
+        scan::<N>(line, |f| out = Some((0..N).map(|i| f.get(i).to_vec()).collect()));
         out
     }
 
@@ -379,6 +613,47 @@ mod tests {
         }
         assert!(parse_ts(b"2000-02-29T00:00:00Z").is_some());
         assert_eq!(parse_ts(b"1234567890123456789"), Some(1234567890123456789));
+    }
+
+    #[test]
+    fn simd_timestamps_match_reference() {
+        let mut seed = 12345u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet = b"0123456789-T:Z+zt .e\r";
+        let bases: [&[u8]; 6] = [b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00+12:00", b"1791071890000", b"0001791071890000",
+            b"2027-12-31T23:59:59-10:00", b"9999-12-31T23:59:59Z"];
+        let mut n = 0;
+        for _ in 0..300_000 {
+            let mut v = bases[(rnd() % 6) as usize].to_vec();
+            for _ in 0..(rnd() % 3) {
+                let i = (rnd() as usize) % v.len();
+                v[i] = alphabet[(rnd() as usize) % alphabet.len()];
+            }
+            if rnd() % 7 == 0 {
+                v.truncate((rnd() as usize) % (v.len() + 1));
+            }
+            assert_eq!(parse_ts(&v), parse_ts_ref(&v), "{:?}", String::from_utf8_lossy(&v));
+            n += parse_ts(&v).is_some() as u32;
+        }
+        assert!(n > 1000);
+        for y in [0u32, 1, 1969, 1970, 2000, 2024, 2025, 2028, 2100, 9999] {
+            for m in 0..=13 {
+                for d in [0, 1, 28, 29, 30, 31, 32] {
+                    for t in ["00:00:00Z", "23:59:59Z", "24:00:00Z", "12:60:00Z", "12:00:60Z", "05:06:07+23:59", "05:06:07-00:00", "05:06:07+24:00", "05:06:07+05:60", "05:06:07*05:00"] {
+                        let v = format!("{y:04}-{m:02}-{d:02}T{t}");
+                        assert_eq!(parse_ts(v.as_bytes()), parse_ts_ref(v.as_bytes()), "{v}");
+                    }
+                }
+            }
+        }
+        for v in ["1", "0", "9999999999999999", "99999999999999999", "999999999999999999", "9223372036854775807", "9223372036854775808", "0000000000000000000000001"] {
+            assert_eq!(parse_ts(v.as_bytes()), parse_ts_ref(v.as_bytes()), "{v}");
+        }
     }
 
     #[test]
@@ -425,7 +700,7 @@ mod tests {
         let mut lines = vec![];
         let long = format!("{},x\n", "y".repeat(150));
         let data = format!("a,b\n\n\"c\",\"d\"\nbad\ne,f,g\n{long}h,\"i\"\"\nj,k\r\nl,m");
-        scan::<2>(data.as_bytes(), |f| lines.push((f[0].to_vec(), f[1].to_vec())));
+        scan::<2>(data.as_bytes(), |f| lines.push((f.get(0).to_vec(), f.get(1).to_vec())));
         let want: Vec<(Vec<u8>, Vec<u8>)> = [("a", "b"), ("c", "d"), (&*"y".repeat(150), "x"), ("j", "k\r"), ("l", "m")]
             .iter()
             .map(|(a, b)| (a.as_bytes().to_vec(), b.as_bytes().to_vec()))
@@ -435,9 +710,41 @@ mod tests {
         for pad in 0..70 {
             let data = format!("{}\n\"u\",\"v\"\nw,x\"\n", "z".repeat(pad));
             let mut got = vec![];
-            scan::<2>(data.as_bytes(), |f| got.push((f[0].to_vec(), f[1].to_vec())));
+            scan::<2>(data.as_bytes(), |f| got.push((f.get(0).to_vec(), f.get(1).to_vec())));
             assert_eq!(got, vec![(b"u".to_vec(), b"v".to_vec())], "pad {pad}");
         }
+    }
+
+    #[test]
+    fn line_fast_paths_match() {
+        let mut seed = 99u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alpha = b"0123456789AZaz_ ,-:\r09azAZ@[`{/";
+        let mut data = Vec::new();
+        for _ in 0..200_000 {
+            let n1 = (rnd() % 13) as usize;
+            for _ in 0..n1 {
+                data.push(alpha[(rnd() as usize) % alpha.len()]);
+            }
+            data.push(b',');
+            let n2 = (rnd() % 18) as usize;
+            for _ in 0..n2 {
+                data.push(if rnd() % 9 == 0 { alpha[(rnd() as usize) % alpha.len()] } else { b'0' + (rnd() % 10) as u8 });
+            }
+            data.push(b'\n');
+        }
+        let mut n = 0;
+        scan::<2>(&data, |f| {
+            assert_eq!(f.key(0), key(f.get(0)), "{:?}", String::from_utf8_lossy(f.get(0)));
+            assert_eq!(f.ts(1), parse_ts_ref(f.get(1)), "{:?}", String::from_utf8_lossy(f.get(1)));
+            n += 1;
+        });
+        assert!(n > 100_000);
     }
 
     #[test]
