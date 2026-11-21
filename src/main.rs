@@ -183,12 +183,12 @@ pub struct PCl {
     pub camp: u32,
 }
 
+/// Per (campaign, day) credited counters; assists live in a separate compact u32 array.
 #[derive(Clone, Copy, Default)]
-pub struct CampDay {
-    pub sessions: u64,
-    pub purchasing: u64,
+pub struct Cred {
+    pub sessions: u32,
+    pub purchasing: u32,
     pub revenue: u64,
-    pub assisted: u64,
 }
 
 pub struct UserRow {
@@ -474,27 +474,27 @@ fn main() {
     let bits = |v: i64| 64 - (v.max(1) as u64 - 1).leading_zeros();
     let ctx = person::Ctx { ws, cws, day0, ndays, ev_bits: bits(we - ws), cl_bits: bits(we - cws) };
     assert!(ctx.cl_bits <= 40, "window too long");
-    let results: Vec<(Vec<UserRow>, Vec<CampDay>, person::Scratch)> = par_tasks(
+    let results: Vec<(Vec<UserRow>, Vec<Cred>, Vec<u32>, person::Scratch)> = par_tasks(
         NB,
         threads,
-        || (Vec::new(), vec![CampDay::default(); ncamp * ndays], person::Scratch::default()),
-        |(rows, cd, scratch), oi| {
+        || (Vec::new(), vec![Cred::default(); ncamp * ndays], vec![0u32; ncamp * ndays], person::Scratch::default()),
+        |(rows, cr, asst, scratch), oi| {
             let b = order[oi];
             let evs: Vec<&[PEv]> = pev_parts.iter().flat_map(|t| t[b].blocks()).collect();
             let cls: Vec<&[PCl]> = pcl_parts.iter().flat_map(|t| t[b].blocks()).collect();
-            person::process(&ctx, &evs, &cls, scratch, ncamp, ncat, rows, cd);
+            person::process(&ctx, &evs, &cls, scratch, ncamp, ncat, rows, cr, asst);
         },
     );
     tm.lap("sessions");
 
-    let mut cd = vec![CampDay::default(); ncamp * ndays];
+    let mut cd = vec![(0u64, 0u64, 0u64, 0u64); ncamp * ndays];
     let mut rows: Vec<Vec<UserRow>> = vec![];
-    for (r, c, _) in results {
-        for (a, b) in cd.iter_mut().zip(c) {
-            a.sessions += b.sessions;
-            a.purchasing += b.purchasing;
-            a.revenue += b.revenue;
-            a.assisted += b.assisted;
+    for (r, cr, asst, _) in results {
+        for ((a, b), x) in cd.iter_mut().zip(cr).zip(asst) {
+            a.0 += b.sessions as u64;
+            a.1 += b.purchasing as u64;
+            a.2 += b.revenue;
+            a.3 += x as u64;
         }
         rows.push(r);
     }
@@ -502,12 +502,12 @@ fn main() {
     for c in 0..ncamp {
         for d in 0..ndays {
             let x = cd[c * ndays + d];
-            if x.sessions > 0 || x.assisted > 0 {
-                camp_rows.push((c, (day0 + d as i64) as i32, x.sessions, x.purchasing, x.revenue, x.assisted));
+            if x.0 > 0 || x.3 > 0 {
+                camp_rows.push((c, (day0 + d as i64) as i32, x.0, x.1, x.2, x.3));
             }
         }
     }
-    out::write_all(&outdir, &rows, &cats, &camp_names, &camp_rows);
+    out::write_all(&outdir, &rows, &cats, &camp_names, &camp_rows, threads);
     tm.lap("write");
     eprintln!("{:>12}: {:8.1} ms", "total", t0.elapsed().as_secs_f64() * 1e3);
     std::process::exit(0);

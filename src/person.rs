@@ -1,5 +1,5 @@
 use crate::parse::{DAY, cmp_key, mix};
-use crate::{CampDay, PCl, PEv, UserRow};
+use crate::{Cred, PCl, PEv, UserRow};
 use std::cmp::Ordering;
 
 const GAP: i64 = 1_800_000;
@@ -142,7 +142,8 @@ pub fn process(
     ncamp: usize,
     ncat: usize,
     rows: &mut Vec<UserRow>,
-    cd: &mut [CampDay],
+    cr: &mut [Cred],
+    asst: &mut [u32],
 ) {
     let n: usize = evs.iter().map(|v| v.len()).sum();
     if n == 0 {
@@ -204,26 +205,24 @@ pub fn process(
         s.starts.clear();
         s.sdays.clear();
         let (mut lo, mut hi) = (0, 0);
-        let mut cur: Option<UserRow> = None;
+        let mut row = UserRow { pkey, day: i32::MIN, sessions: 0, events: 0, revenue: 0, top: u32::MAX };
         let mut a = 0;
         while a < ev.len() {
             let start = ets(&ev[a]);
             let mut j = a + 1;
             let mut prev = start;
+            let mut rev = ev[a].price as u64;
             while j < ev.len() {
                 let t = ets(&ev[j]);
                 if t - prev > GAP {
                     break;
                 }
                 prev = t;
+                rev += ev[j].price as u64;
                 j += 1;
             }
             let day = start.div_euclid(DAY);
             let di = (day - ctx.day0) as usize;
-            let mut rev = 0u64;
-            for e in &ev[a..j] {
-                rev += e.price as u64;
-            }
             while hi < cl.len() && cts(&cl[hi]) <= start {
                 hi += 1;
             }
@@ -244,28 +243,30 @@ pub fn process(
             } else {
                 ORGANIC
             };
-            let c = &mut cd[camp as usize * nd + di];
+            let c = &mut cr[camp as usize * nd + di];
             c.sessions += 1;
             c.revenue += rev;
-            c.purchasing += (rev > 0) as u64;
+            c.purchasing += (rev > 0) as u32;
             s.starts.push(start);
             s.sdays.push(di as u32);
             let day = day as i32;
-            if cur.as_ref().is_some_and(|r| r.day != day) {
-                rows.push(finish(cur.take().unwrap(), &mut s.catsum));
+            if row.day != day {
+                if row.day != i32::MIN {
+                    rows.push(finish(row, &mut s.catsum));
+                }
+                row = UserRow { pkey, day, sessions: 0, events: 0, revenue: 0, top: u32::MAX };
             }
             if rev > 0 {
                 for e in &ev[a..j] {
                     s.catsum[e.cat as usize] += e.price as u64;
                 }
             }
-            let r = cur.get_or_insert(UserRow { pkey, day, sessions: 0, events: 0, revenue: 0, top: u32::MAX });
-            r.sessions += 1;
-            r.events += (j - a) as u32;
-            r.revenue += rev;
+            row.sessions += 1;
+            row.events += (j - a) as u32;
+            row.revenue += rev;
             a = j;
         }
-        rows.push(finish(cur.take().unwrap(), &mut s.catsum));
+        rows.push(finish(row, &mut s.catsum));
 
         // Assists: campaign c assists every session whose start lies in the union of [t, t + 7d]
         // over c's clicks t; each merged interval adds its sessions per day.
@@ -282,12 +283,12 @@ pub fn process(
                 s.stamp = 1;
             }
             s.active.clear();
-            let flush = |c: u32, a: i64, b: i64, cd: &mut [CampDay], st: &[i64], days: &[u32], re: &[u32]| {
+            let flush = |c: u32, a: i64, b: i64, asst: &mut [u32], st: &[i64], days: &[u32], re: &[u32]| {
                 let mut i = st.partition_point(|&x| x < a);
                 let j = st.partition_point(|&x| x <= b);
                 while i < j {
                     let k = (re[i] as usize).min(j);
-                    cd[c as usize * nd + days[i] as usize].assisted += (k - i) as u64;
+                    asst[c as usize * nd + days[i] as usize] += (k - i) as u32;
                     i = k;
                 }
             };
@@ -299,7 +300,7 @@ pub fn process(
                     s.ib[c] = t + WEEK;
                     s.active.push(c as u32);
                 } else if t > s.ib[c] {
-                    flush(c as u32, s.ia[c], s.ib[c], cd, &s.starts, &s.sdays, &s.run_end);
+                    flush(c as u32, s.ia[c], s.ib[c], asst, &s.starts, &s.sdays, &s.run_end);
                     s.ia[c] = t;
                     s.ib[c] = t + WEEK;
                 } else {
@@ -307,7 +308,7 @@ pub fn process(
                 }
             }
             for &c in &s.active {
-                flush(c, s.ia[c as usize], s.ib[c as usize], cd, &s.starts, &s.sdays, &s.run_end);
+                flush(c, s.ia[c as usize], s.ib[c as usize], asst, &s.starts, &s.sdays, &s.run_end);
             }
         }
         i = pe;
@@ -316,6 +317,9 @@ pub fn process(
 }
 
 fn finish(mut r: UserRow, catsum: &mut [u64]) -> UserRow {
+    if r.revenue == 0 {
+        return r;
+    }
     let mut best = 0;
     for (i, x) in catsum.iter_mut().enumerate() {
         if *x > best {

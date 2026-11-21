@@ -523,11 +523,19 @@ fn intern(b: &[u8]) -> u64 {
 }
 
 pub fn key_bytes(k: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    key_append(k, &mut out);
+    out
+}
+
+/// Appends the string behind key k to `out`.
+#[inline]
+pub fn key_append(k: u64, out: &mut Vec<u8>) {
     if k & INTERNED != 0 {
         let g = LONG.lock().unwrap();
-        return g.as_ref().unwrap().1[(k & !INTERNED) as usize].clone();
+        out.extend_from_slice(&g.as_ref().unwrap().1[(k & !INTERNED) as usize]);
+        return;
     }
-    let mut out = Vec::with_capacity(10);
     for i in 0..10 {
         let c = (k >> (6 * (9 - i))) & 63;
         if c == 0 {
@@ -535,7 +543,6 @@ pub fn key_bytes(k: u64) -> Vec<u8> {
         }
         out.push(ALPHA[c as usize]);
     }
-    out
 }
 
 /// Byte-wise order of the strings behind two keys.

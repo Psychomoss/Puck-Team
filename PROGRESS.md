@@ -57,6 +57,7 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | 2 | branch-free quote stripping in scanner (46 -> 30 ns/line), batched+prefetched click person lookups, person stage rewritten: LSD radix sort on packed (person id, ts) 16 B records, click ties resolved at credit time, assists via per-campaign interval union (O(clicks) instead of O(sessions x window clicks)) | 1.32 s | 3.28 s | yes |
 | 3 | pread into per-thread buffers instead of mmap; append-only block lists (1024-record blocks) for all bucket stores instead of over-reserved Vecs; per-stage user/sys CPU in timings. Peak RSS final 15 GB -> 5.7 GB | 1.24 s | 3.22 s | yes |
 | 4 | SIMD timestamps (F3: right-aligned 16-digit maddubs/madd; F1/F2: two 16-byte compares + shuffle), `Line` API keeping the chunk buffer so ID packing (6-bit, SSE) and F3 parsing read 16 bytes in-bounds without copies; differential tests vs scalar references | 1.21 s | 3.02 s | yes |
+| 5 | Parquet: no dictionary, no statistics, Int32 counts, rows split into equal 256K-row files written by the work-stealing pool; person stage: assists in a separate u32 campaign x day array (112 KB, L2-resident), credited counters 16 B, single pass for gap+revenue, skip category argmax without purchases | 1.10 s | 2.76 s | yes |
 
 Notes from experiments:
 - split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
@@ -68,4 +69,7 @@ Notes from experiments:
 - pread vs mmap: same speed; pread kept (no page-table teardown, no RSS from file pages).
 - Bucket count 512/1024/2048: within noise (laptop noise ~5%: background VM). Kept 1024.
 - Dedup at final: hash pass ~27 ns/record, emit (random person lookup + scatter) ~48 ns/record.
+- Radix digit width in person stage: 11 bits best (8: +70 ms, 10: +35 ms at final).
+- Final has 10.0M sessions, 58.8M surviving events, 2.0M persons, 6.6M user rows, 104M assist pairs.
+- Regression caught by fixtures: zero user rows must still produce one (empty) parquet file.
 - Limitation: window (+7 days) must be < 2^40 ms (34 years) for the packed sort key; asserted at startup. purge_delay=-1: ~250 ms gain at final (less page faulting).
