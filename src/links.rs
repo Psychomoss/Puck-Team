@@ -45,17 +45,19 @@ fn zeroed<T>(n: usize) -> Vec<T> {
     unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut T, n, n) }
 }
 
+/// Union-find over slots with parent stored as index + 1 (0 = root), so the array starts zeroed.
 fn find(p: &[AtomicU32], mut x: u32) -> u32 {
     loop {
         let px = p[x as usize].load(Relaxed);
-        if px == x {
+        if px == 0 {
             return x;
         }
-        let gp = p[px as usize].load(Relaxed);
-        if gp != px {
-            p[x as usize].store(gp, Relaxed);
+        let gp = p[(px - 1) as usize].load(Relaxed);
+        if gp == 0 {
+            return px - 1;
         }
-        x = gp;
+        p[x as usize].store(gp, Relaxed);
+        x = gp - 1;
     }
 }
 
@@ -101,7 +103,7 @@ pub fn build(input: &Input, threads: usize, tm: &mut Timer) -> Persons {
     });
     tm.lap("links parse");
 
-    let parent: Vec<AtomicU32> = (0..cap as u32).map(AtomicU32::new).collect();
+    let parent: Vec<AtomicU32> = zeroed(cap);
     par_tasks(tasks.len(), threads, || (), |_, i| {
         let (t, a) = tasks[i];
         let v = &pairs[t];
@@ -114,19 +116,20 @@ pub fn build(input: &Input, threads: usize, tm: &mut Timer) -> Persons {
                     break;
                 }
                 let (lo, hi) = (x.min(y), x.max(y));
-                if parent[hi as usize].compare_exchange(hi, lo, Relaxed, Relaxed).is_ok() {
+                if parent[hi as usize].compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
                     break;
                 }
             }
         }
     });
-    let best: Vec<AtomicU64> = (0..cap).map(|_| AtomicU64::new(u64::MAX)).collect();
+    // Group minimum as the maximum of !key, so the array starts zeroed.
+    let best: Vec<AtomicU64> = zeroed(cap);
     let nblk = cap.div_ceil(STEP);
     par_tasks(nblk, threads, || (), |_, b| {
         for s in b * STEP..((b + 1) * STEP).min(cap) {
             let k = keys[s].load(Relaxed);
             if k != 0 {
-                best[find(&parent, s as u32) as usize].fetch_min(k, Relaxed);
+                best[find(&parent, s as u32) as usize].fetch_max(!k, Relaxed);
             }
         }
     });
@@ -143,7 +146,7 @@ pub fn build(input: &Input, threads: usize, tm: &mut Timer) -> Persons {
         }
         for s in 0..cap {
             if b2[s] != 0 {
-                best[s].store(b2[s], Relaxed);
+                best[s].store(!b2[s], Relaxed);
             }
         }
     }
@@ -153,7 +156,7 @@ pub fn build(input: &Input, threads: usize, tm: &mut Timer) -> Persons {
         for s in b * STEP..((b + 1) * STEP).min(cap) {
             let k = keys[s].load(Relaxed);
             if k != 0 {
-                unsafe { *tp.ptr().add(s) = [k, best[find(&parent, s as u32) as usize].load(Relaxed)] };
+                unsafe { *tp.ptr().add(s) = [k, !best[find(&parent, s as u32) as usize].load(Relaxed)] };
             }
         }
     });
