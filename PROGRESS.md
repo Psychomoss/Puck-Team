@@ -5,7 +5,9 @@ Team puck, Shopping Sessions, Rust. Read this and `git log` first when resuming.
 ## Status
 - Phase 0 (setup): done.
 - Phase 1 (correct Rust pipeline): done. Gate 1 passed.
-- Next: Phase 2 (Docker image).
+- Phase 2 (Docker): done. Multi-stage (rust:1.95-slim-bookworm -> debian:bookworm-slim, needs `chmod` for
+  docker_run.sh cleanup), mimalloc, fat LTO, x86-64-v3. Docker: fixtures 36/36, dev MATCH (0.53 s wall incl. container start).
+- Next: Phase 3 (performance).
 
 ## How to check
 - `scripts/verify.sh` runs fixtures (36), dev compare vs `dev-answer/`, golden hashes on practice and final,
