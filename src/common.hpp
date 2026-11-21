@@ -190,6 +190,7 @@ struct Input {
     struct File {
         int fd;
         size_t len;
+        const uint8_t* map;  // whole file mapped read-only, or null when reading with pread
     };
     std::vector<File> files;
     struct Chunk {
@@ -200,8 +201,8 @@ struct Input {
 
     static Input open(const std::string& dir, bool reverse);
     size_t size() const { return chunks.size(); }
-    /// Reads chunk i into buf and returns the lines that start in its byte range (each file's
-    /// header line is skipped). The returned range has no trailing newline requirement.
+    /// The lines that start in chunk i's byte range (each file's header line is skipped): a view
+    /// into the file mapping, or (INPUT_MODE=pread) a copy read into buf.
     std::pair<const uint8_t*, size_t> read(size_t i, std::vector<uint8_t>& buf) const;
 };
 

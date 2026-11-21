@@ -94,6 +94,11 @@ void pread_exact(int fd, uint8_t* p, size_t n, size_t off) {
 }
 
 int64_t floor_div(int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+
+bool use_pread() {
+    const char* v = std::getenv("INPUT_MODE");
+    return v && std::string_view(v) == "pread";
+}
 }  // namespace
 
 Input Input::open(const std::string& dir, bool reverse) {
@@ -114,9 +119,15 @@ Input Input::open(const std::string& dir, bool reverse) {
             close(fd);
             continue;
         }
+        const uint8_t* map = nullptr;
+        if (!use_pread()) {
+            void* m = mmap(nullptr, len, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m == MAP_FAILED) std::abort();
+            map = static_cast<const uint8_t*>(m);
+        }
         in.bytes += len;
         for (size_t a = 0; a < len; a += CHUNK) in.chunks.push_back({in.files.size(), a, std::min(a + CHUNK, len)});
-        in.files.push_back({fd, len});
+        in.files.push_back({fd, len, map});
     }
     if (reverse) std::reverse(in.chunks.begin(), in.chunks.end());
     return in;
@@ -124,7 +135,26 @@ Input Input::open(const std::string& dir, bool reverse) {
 
 std::pair<const uint8_t*, size_t> Input::read(size_t i, std::vector<uint8_t>& buf) const {
     auto [fi, a, b] = chunks[i];
-    auto [fd, len] = files[fi];
+    auto [fd, len, map] = files[fi];
+    if (map) {
+        size_t first;
+        if (a == 0) {
+            auto* p = static_cast<const uint8_t*>(std::memchr(map, '\n', len));
+            if (!p) return {map, 0};
+            first = size_t(p - map) + 1;
+        } else if (map[a - 1] == '\n') {
+            first = a;
+        } else {
+            auto* p = static_cast<const uint8_t*>(std::memchr(map + a, '\n', len - a));
+            if (!p) return {map, 0};
+            first = size_t(p - map) + 1;
+        }
+        if (first >= b) return {map, 0};
+        // The last line starting before b ends at the first newline at or after b - 1.
+        auto* p = static_cast<const uint8_t*>(std::memchr(map + b - 1, '\n', len - (b - 1)));
+        size_t last = p ? size_t(p - map) : len;
+        return {map + first, last - first};
+    }
     size_t start = a ? a - 1 : 0;
     size_t end = std::min(b + 4096, len);
     buf.resize(end - start);
