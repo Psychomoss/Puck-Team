@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 pub const DAY: i64 = 86_400_000;
 
@@ -67,6 +67,15 @@ impl<'a, const N: usize> Line<'a, N> {
         }
         key(self.get(i))
     }
+    /// The packed key of field i if it packs (never interns).
+    #[inline(always)]
+    pub fn packed(&self, i: usize) -> Option<u64> {
+        let (s, e) = (self.st[i], self.en[i]);
+        if e - s <= 10 && s + 16 <= self.data.len() {
+            return unsafe { pack16(self.data.as_ptr().add(s), e - s) };
+        }
+        pack(self.get(i))
+    }
     #[inline(always)]
     pub fn ts(&self, i: usize) -> Option<i64> {
         let (s, e) = (self.st[i], self.en[i]);
@@ -80,8 +89,8 @@ impl<'a, const N: usize> Line<'a, N> {
 
 /// Calls `f` with every well-formed line of `data` that has N fields (rules' dialect: only `\n`
 /// ends a line, quotes only around a whole field and stripped). Malformed lines are skipped.
-#[inline(always)]
-pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&Line<N>)) {
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn scan_blocks<const N: usize>(data: &[u8], mut f: impl FnMut(&Line<N>)) {
     let len = data.len();
     let mut ls = 0usize;
     let mut nf = 0usize;
@@ -136,6 +145,130 @@ pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&Line<N>)) {
         ends[N - 1] = len;
         emit(ls, &ends, quotes);
     }
+}
+
+/// Emits line `data[ls..le]` if it has N fields and legal quotes; field ends in `ends` (absolute).
+#[inline(always)]
+fn emit_line<const N: usize>(data: &[u8], ls: usize, ends: &[usize; N], mut q: u32, f: &mut impl FnMut(&Line<N>)) {
+    let mut line = Line { data, st: [0; N], en: [0; N] };
+    let mut s = ls;
+    for i in 0..N {
+        let e = ends[i];
+        let l = e - s;
+        let first = unsafe { *data.get_unchecked(s.min(data.len() - 1)) };
+        let last = unsafe { *data.get_unchecked(e.wrapping_sub(1).min(data.len() - 1)) };
+        let st = ((first == b'"') & (last == b'"') & (l >= 2)) as usize;
+        q = q.wrapping_sub(2 * st as u32);
+        line.st[i] = s + st;
+        line.en[i] = e - st;
+        s = e + 1;
+    }
+    if q == 0 {
+        f(&line);
+    }
+}
+
+const NLF: u32 = 1 << 31;
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<(Vec<u32>, Vec<u32>, Vec<u64>)> = const { std::cell::Cell::new((Vec::new(), Vec::new(), Vec::new())) };
+}
+
+/// Calls `f` with every well-formed line of `data` that has N fields (rules' dialect: only `\n`
+/// ends a line, quotes only around a whole field and stripped). Malformed lines are skipped.
+/// Pass 1 flattens all comma/newline positions (no dependency between blocks); pass 2 walks lines
+/// from that list, so consecutive lines overlap in the pipeline.
+#[inline(always)]
+pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&Line<N>)) {
+    let len = data.len();
+    if len == 0 {
+        return;
+    }
+    assert!(len < NLF as usize);
+    let (mut pos, mut cq, mut qb) = SCRATCH.take();
+    let nblk = len.div_ceil(64);
+    pos.clear();
+    pos.reserve(len + 64 + 2 * N);
+    cq.clear();
+    cq.reserve(nblk + 1);
+    qb.clear();
+    qb.reserve(nblk + 1);
+    let mut n = 0usize;
+    let mut quotes = 0u32;
+    unsafe {
+        let pp = pos.as_mut_ptr();
+        let cp = cq.as_mut_ptr();
+        let qp = qb.as_mut_ptr();
+        for blk in 0..nblk {
+            let base = blk * 64;
+            let (nl, cm, qt) = masks(data, base);
+            *cp.add(blk) = quotes;
+            *qp.add(blk) = qt;
+            quotes += qt.count_ones();
+            let mut st = nl | cm;
+            let cnt = st.count_ones() as usize;
+            let out = pp.add(n);
+            for j in 0..8 {
+                let tz = st.trailing_zeros();
+                *out.add(j) = (base as u32 + tz) | ((nl.wrapping_shr(tz) as u32 & 1) << 31);
+                st &= st.wrapping_sub(1);
+            }
+            let mut j = 8;
+            while st != 0 {
+                let tz = st.trailing_zeros();
+                *out.add(j) = (base as u32 + tz) | ((nl.wrapping_shr(tz) as u32 & 1) << 31);
+                st &= st - 1;
+                j += 1;
+            }
+            n += cnt;
+        }
+        *cp.add(nblk) = quotes;
+        // A last line without '\n' ends at len; padding keeps reads of N entries in bounds.
+        if *data.get_unchecked(len - 1) != b'\n' {
+            *pp.add(n) = len as u32 | NLF;
+            n += 1;
+        }
+        for j in 0..N {
+            *pp.add(n + j) = len as u32 | NLF;
+        }
+        pos.set_len(n + N);
+        *qp.add(nblk) = 0;
+        cq.set_len(nblk + 1);
+        qb.set_len(nblk + 1);
+    }
+    let qbefore = |x: usize| -> u32 {
+        let b = x >> 6;
+        let o = x & 63;
+        unsafe { *cq.get_unchecked(b) + (*qb.get_unchecked(b) & ((1u64 << o) - 1)).count_ones() }
+    };
+    let mut k = 0;
+    let mut ls = 0usize;
+    let mut qs = 0u32;
+    while k < n {
+        let e: [u32; N] = std::array::from_fn(|i| unsafe { *pos.get_unchecked(k + i) });
+        let mut early = 0;
+        for x in &e[..N - 1] {
+            early |= *x;
+        }
+        if early & NLF == 0 && e[N - 1] & NLF != 0 {
+            let ends: [usize; N] = std::array::from_fn(|i| (e[i] & !NLF) as usize);
+            let le = ends[N - 1];
+            let qe = qbefore(le);
+            emit_line(data, ls, &ends, qe - qs, &mut f);
+            qs = qe;
+            ls = le + 1;
+            k += N;
+        } else {
+            while unsafe { *pos.get_unchecked(k) } & NLF == 0 {
+                k += 1;
+            }
+            let le = (pos[k] & !NLF) as usize;
+            qs = qbefore(le);
+            ls = le + 1;
+            k += 1;
+        }
+    }
+    SCRATCH.set((pos, cq, qb));
 }
 
 /// 6-bit packing of `l` (<= 10) bytes at p, reading 16 bytes; None if a byte is outside [0-9A-Z_a-z].
@@ -291,10 +424,122 @@ fn civil_ms(y: u32, mo: u32, d: u32, h: u32, mi: u32, se: u32) -> Option<i64> {
     Some((days_from_civil(y, mo, d) * 86_400 + (h * 3600 + mi * 60 + se) as i64) * 1000)
 }
 
+/// Valid dates near the window: slot (month parity, day digits) -> ("YYYY-MM-", "DD", epoch ms of
+/// midnight). Filled once before parsing starts; dates not in it take the full path.
+static DATES: [[AtomicU64; 2]; 128] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 128];
+
+#[inline(always)]
+fn date_slot(p6: u8, p8: u8, p9: u8) -> usize {
+    ((p6 as usize & 1) << 6) | ((p8 as usize & 3) << 4) | (p9 as usize & 15)
+}
+
+/// Registers every date from day `d0` to day `d1` (days since epoch) in the date table.
+pub fn set_dates(d0: i64, d1: i64) {
+    for d in d0..=d1 {
+        let (y, m, dd) = civil_from_days(d);
+        if !(0..=9999).contains(&y) {
+            continue;
+        }
+        let txt = format!("{y:04}-{m:02}-{dd:02}");
+        let b = txt.as_bytes();
+        let slot = &DATES[date_slot(b[6], b[8], b[9])];
+        if slot[0].load(Relaxed) != 0 {
+            continue;
+        }
+        let k = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let v = (u16::from_le_bytes([b[8], b[9]]) as u64) << 48 | (d * DAY - MIN_DATE_MS) as u64;
+        slot[1].store(v, Relaxed);
+        slot[0].store(k, std::sync::atomic::Ordering::Release);
+    }
+}
+
+const MIN_DATE_MS: i64 = -62_167_219_200_000;
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Seconds of day for "HH:MM:SS" at p (8 bytes), validated with SWAR.
+#[inline(always)]
+unsafe fn hms(p: *const u8) -> Option<u32> {
+    let x = unsafe { (p as *const u64).read_unaligned() };
+    const CM: u64 = 0x0000_FF00_00FF_0000;
+    if x & CM != 0x0000_3A00_003A_0000 {
+        return None;
+    }
+    let y = (x & !CM) | 0x0000_3000_0030_0000;
+    const HI: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    if (y & HI) != 0x3030_3030_3030_3030 || (y.wrapping_add(0x0606_0606_0606_0606) & HI) != 0x3030_3030_3030_3030 {
+        return None;
+    }
+    let d = y - 0x3030_3030_3030_3030;
+    let t = d * 10 + (d >> 8);
+    let (h, m, s) = ((t & 0xFF) as u32, ((t >> 24) & 0xFF) as u32, ((t >> 48) & 0xFF) as u32);
+    if h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
+}
+
+/// F1/F2 via the date table; None means "not decided here" (fall back to the full parser).
+#[inline(always)]
+fn iso_fast(s: &[u8]) -> Option<Option<i64>> {
+    let p = s.as_ptr();
+    let e = &DATES[date_slot(s[6], s[8], s[9])];
+    let k = unsafe { (p as *const u64).read_unaligned() };
+    let dd = unsafe { (p.add(8) as *const u16).read_unaligned() };
+    let ek = e[0].load(std::sync::atomic::Ordering::Acquire);
+    let v = e[1].load(Relaxed);
+    if ek != k || (v >> 48) as u16 != dd {
+        return None;
+    }
+    let base = (v & 0xFFFF_FFFF_FFFF) as i64 + MIN_DATE_MS;
+    if s[10] != b'T' {
+        return Some(None);
+    }
+    let Some(sod) = (unsafe { hms(p.add(11)) }) else { return Some(None) };
+    let t = base + sod as i64 * 1000;
+    if s.len() == 20 {
+        return Some((s[19] == b'Z').then_some(t));
+    }
+    let sign = match s[19] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return Some(None),
+    };
+    let (a, b, c, d) = (dg(s[20]), dg(s[21]), dg(s[23]), dg(s[24]));
+    if s[22] != b':' || a >= 10 || b >= 10 || c >= 10 || d >= 10 {
+        return Some(None);
+    }
+    let (oh, om) = (a * 10 + b, c * 10 + d);
+    if oh > 23 || om > 59 {
+        return Some(None);
+    }
+    Some(Some(t - sign * (oh * 60 + om) as i64 * 60_000))
+}
+
 /// F1 (20 bytes) or F2 (25 bytes): every fixed character and digit checked with two 16-byte compares.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
 fn iso(s: &[u8]) -> Option<i64> {
+    if let Some(r) = iso_fast(s) {
+        return r;
+    }
+    iso_full(s)
+}
+
+#[cfg(target_feature = "avx2")]
+#[inline(never)]
+fn iso_full(s: &[u8]) -> Option<i64> {
     use std::arch::x86_64::*;
     let f2 = s.len() == 25;
     unsafe {
@@ -571,6 +816,14 @@ impl RefMap {
             None => self.long.insert(b.to_vec(), v),
         };
     }
+    /// Lookup of field i of a line, using the SIMD packing fast path.
+    #[inline(always)]
+    pub fn get_field<const N: usize>(&self, l: &Line<N>, i: usize) -> Option<u32> {
+        match l.packed(i) {
+            Some(k) => self.short.get(&k).copied(),
+            None => self.long.get(l.get(i)).copied(),
+        }
+    }
     #[inline]
     pub fn get(&self, b: &[u8]) -> Option<u32> {
         match pack(b) {
@@ -592,6 +845,8 @@ mod tests {
 
     #[test]
     fn timestamps() {
+        set_dates(days_from_civil(2028, 2, 1), days_from_civil(2028, 3, 5));
+        set_dates(days_from_civil(2026, 9, 25), days_from_civil(2026, 10, 10));
         let f1 = parse_ts(b"2026-10-03T23:58:10Z").unwrap();
         assert_eq!(f1, 1791071890000);
         assert_eq!(parse_ts(b"2026-10-03T19:58:10-04:00"), Some(f1));
@@ -624,6 +879,9 @@ mod tests {
 
     #[test]
     fn simd_timestamps_match_reference() {
+        set_dates(days_from_civil(2028, 2, 1), days_from_civil(2028, 3, 5));
+        set_dates(days_from_civil(2026, 9, 25), days_from_civil(2026, 10, 10));
+        set_dates(days_from_civil(2027, 12, 20), days_from_civil(2028, 1, 3));
         let mut seed = 12345u64;
         let mut rnd = || {
             seed ^= seed << 13;
@@ -660,6 +918,14 @@ mod tests {
         }
         for v in ["1", "0", "9999999999999999", "99999999999999999", "999999999999999999", "9223372036854775807", "9223372036854775808", "0000000000000000000000001"] {
             assert_eq!(parse_ts(v.as_bytes()), parse_ts_ref(v.as_bytes()), "{v}");
+        }
+    }
+
+    #[test]
+    fn civil_round_trip() {
+        for d in -719_528..2_932_896 {
+            let (y, m, dd) = civil_from_days(d);
+            assert_eq!(days_from_civil(y as u32, m, dd), d, "{d}");
         }
     }
 
@@ -719,6 +985,38 @@ mod tests {
             let mut got = vec![];
             scan::<2>(data.as_bytes(), |f| got.push((f.get(0).to_vec(), f.get(1).to_vec())));
             assert_eq!(got, vec![(b"u".to_vec(), b"v".to_vec())], "pad {pad}");
+        }
+    }
+
+    #[test]
+    fn scan_matches_block_scanner() {
+        let mut seed = 7u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alpha = b"ab,,\"\"\n\r 0";
+        fn collect<const N: usize>(d: &[u8], blocks: bool) -> Vec<Vec<Vec<u8>>> {
+            let mut v = vec![];
+            let mut f = |l: &Line<N>| v.push((0..N).map(|i| l.get(i).to_vec()).collect());
+            if blocks { scan_blocks::<N>(d, &mut f) } else { scan::<N>(d, &mut f) }
+            v
+        }
+        for round in 0..3000 {
+            let n = (rnd() % 400) as usize;
+            let mut d: Vec<u8> = (0..n).map(|_| alpha[(rnd() as usize) % alpha.len()]).collect();
+            if round % 3 == 0 {
+                let line = b"\"e1\",u2,1791071890000,2026-10-03T23:58:10Z,\"view\",p1,\"\"\n";
+                for _ in 0..(rnd() % 8) {
+                    let at = (rnd() as usize) % (d.len() + 1);
+                    d.splice(at..at, line.iter().copied());
+                }
+            }
+            assert_eq!(collect::<2>(&d, false), collect::<2>(&d, true));
+            assert_eq!(collect::<4>(&d, false), collect::<4>(&d, true));
+            assert_eq!(collect::<7>(&d, false), collect::<7>(&d, true));
         }
     }
 

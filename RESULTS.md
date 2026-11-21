@@ -7,7 +7,8 @@ match the scorer: the scorer has 8 vCPUs that are hyperthreads of only ~4 physic
 AVX-512 and server memory. About 0.25 s of every run is fixed Docker overhead (a no-op container with the
 same flags takes 0.25 s here).
 
-Measured code: commit `257e318` (this report is committed right after it; no code changes).
+Measured code: commit `257e318` (this report is committed right after it; no code changes). Phase 5
+changes (zstd output, scanner, timestamps, parse-time person lookup) are logged in `PROGRESS.md`.
 
 ## Wall time (Docker, median of 3)
 
@@ -54,14 +55,16 @@ the slow E-cores just take fewer chunks):
 
 1. **Input**: every `*.csv` is cut into 1 MB byte ranges; a task `pread`s its range into a reused buffer
    and owns the lines that start inside it (header skipped per file).
-2. **CSV scanner**: AVX2 bitmasks of `\n`, `,` and `"` per 64-byte block; fields come from the comma
-   and newline bits, quoting is validated branch-free by counting quotes (a quote is legal only as the
+2. **CSV scanner**: AVX2 bitmasks of `\n`, `,` and `"` per 64-byte block; pass 1 flattens all comma and
+   newline positions of a chunk into a list, pass 2 walks lines from that list (no serial dependency
+   between lines). Quoting is validated branch-free by counting quotes (a quote is legal only as the
    first and last byte of a field). Only `\n` ends a line, so `\r` stays in the data.
 3. **IDs** become exact 8-byte keys: up to 10 chars of `[0-9A-Z_a-z]` are packed as order-preserving
    6-bit codes (SSE), so integer order equals byte order; anything else (spaces, long IDs, non-ASCII)
    goes through an interner, and comparisons then use the real bytes.
-4. **Timestamps**: F1/F2 validated with two 16-byte compares and converted with a shuffle + multiply-add
-   and a days-from-civil formula; F3 is a right-aligned 16-digit SIMD parse (overflow-checked scalar
+4. **Timestamps**: F1/F2 dates come from a read-only table of the dates near the window (built from the
+   manifest; exact 10-byte compare) and `HH:MM:SS` is validated with SWAR; other dates take the full
+   path (two 16-byte compares, shuffle + multiply-add, days-from-civil); F3 is a right-aligned 16-digit SIMD parse (overflow-checked scalar
    path for longer values). Differential tests against a plain scalar reference.
 5. **Links**: a lock-free open-addressing table interns all linked IDs in parallel; a lock-free
    union-find (CAS on roots, path halving) joins them; each group's name is an atomic min over keys.
@@ -69,15 +72,17 @@ the slow E-cores just take fewer chunks):
    1024 buckets of 32-byte records; per bucket a small hash table keeps the copy with the smallest
    `ingest_ts` (dedup before validation, as the rules require), and valid survivors are mapped to their
    person (prefetched lookups) and re-bucketed by person into 16-byte records. Purchases carry a handle
-   to a side table with price and category.
+   to a side table with price and category. The person lookup happens while parsing (prefetched,
+   resolved in batches of 32 lines).
 7. **Clicks** are validated, mapped to persons and bucketed the same way. Click dedup is skipped:
    copies are identical, so they change neither the credited click nor the set of assisting campaigns.
 8. **Sessions**, per person bucket: LSD radix sort on a packed (person id, ts) key; one linear sweep
    per person builds sessions, credits each with a two-pointer window over the person's clicks (ties
    in `ts` broken by the byte-wise smallest `click_id`), and computes assists as the union of
    `[click_ts, click_ts + 7d]` intervals per campaign, so the cost is linear in clicks.
-9. **Output**: Parquet via `arrow`/`parquet` (plain encoding, no compression, no statistics), user
-   rows split into equal 256K-row files written in parallel; the process exits without freeing memory.
+9. **Output**: Parquet via `arrow`/`parquet`, zstd level 1, dictionaries on the low-cardinality columns,
+   no statistics; user rows split into one equal file per thread, written in parallel (practice 9.4 MB,
+   final 28 MB); the process exits without freeing memory.
 
 Build: Rust 1.95 in Docker (`rust:1.95-slim-bookworm`), `opt-level=3`, fat LTO, `codegen-units=1`,
 `panic=abort`, `target-cpu=x86-64-v3` (AVX2, so the same binary runs on the laptop and the scorer),

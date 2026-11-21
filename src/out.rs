@@ -4,7 +4,8 @@ use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{Field, Schema};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::schema::types::ColumnPath;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use std::path::Path;
 use std::sync::Arc;
@@ -14,11 +15,15 @@ fn write(path: &Path, cols: Vec<(&str, ArrayRef, bool)>) {
         cols.iter().map(|(n, a, null)| Field::new(*n, a.data_type().clone(), *null)).collect::<Vec<_>>(),
     ));
     let batch = RecordBatch::try_new(schema.clone(), cols.into_iter().map(|c| c.1).collect()).unwrap();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_dictionary_enabled(false)
-        .set_statistics_enabled(EnabledStatistics::None)
-        .build();
+    let mut b = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(1).unwrap()))
+        .set_dictionary_enabled(true)
+        .set_statistics_enabled(EnabledStatistics::None);
+    // High-cardinality columns: plain + zstd is both smaller and faster than a dictionary.
+    for c in ["user_id", "revenue_cents", "campaign_id"] {
+        b = b.set_column_dictionary_enabled(ColumnPath::from(c), false);
+    }
+    let props = b.build();
     let file = std::fs::File::create(path).unwrap();
     let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
     w.write(&batch).unwrap();
@@ -41,15 +46,28 @@ pub fn write_all(
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
-    const PART: usize = 1 << 18;
-    let mut parts: Vec<&[UserRow]> = rows.iter().flat_map(|r| r.chunks(PART)).collect();
-    if parts.is_empty() {
-        parts.push(&[]);
+    let total: usize = rows.iter().map(|r| r.len()).sum();
+    let per = total.div_ceil(if total < 1 << 16 { 1 } else { threads }).max(1);
+    let mut parts: Vec<Vec<&[UserRow]>> = vec![vec![]];
+    let mut fill = 0;
+    for r in rows {
+        let mut r = &r[..];
+        while !r.is_empty() {
+            if fill == per {
+                parts.push(vec![]);
+                fill = 0;
+            }
+            let (a, b) = r.split_at((per - fill).min(r.len()));
+            parts.last_mut().unwrap().push(a);
+            fill += a.len();
+            r = b;
+        }
     }
     std::thread::scope(|sc| {
         sc.spawn(|| {
             crate::par_tasks(parts.len(), threads, || (), |_, i| {
-                let part = parts[i];
+                let part: Vec<&UserRow> = parts[i].iter().flat_map(|p| p.iter()).collect();
+                let part = &part[..];
                 let mut user = StringBuilder::with_capacity(part.len(), part.len() * 10);
                 let mut name = Vec::with_capacity(16);
                 for r in part {

@@ -167,6 +167,14 @@ struct Ev {
     pc: u32,
 }
 
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+}
+
 #[derive(Clone, Copy)]
 pub struct PEv {
     pub pkey: u64,
@@ -232,50 +240,85 @@ fn json_str(text: &str, name: &str) -> String {
     rest[a..b].to_string()
 }
 
-/// Append-only list of fixed-size blocks: no reallocation copies and no large untouched reservations.
-pub struct BlockVec<T> {
-    blocks: Vec<Vec<T>>,
-    len: usize,
+/// Append-only list of fixed-size blocks: no reallocation copies and no large untouched
+/// reservations; a push is one compare and one store through a cursor.
+pub struct BlockVec<T: Copy> {
+    blocks: Vec<*mut T>,
+    cur: *mut T,
+    end: *mut T,
 }
+
+unsafe impl<T: Copy + Send> Send for BlockVec<T> {}
+unsafe impl<T: Copy + Sync> Sync for BlockVec<T> {}
 
 const BLOCK: usize = 1024;
 
-impl<T> BlockVec<T> {
+impl<T: Copy> BlockVec<T> {
     fn new() -> Self {
-        BlockVec { blocks: Vec::new(), len: 0 }
+        BlockVec { blocks: Vec::new(), cur: std::ptr::null_mut(), end: std::ptr::null_mut() }
+    }
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::array::<T>(BLOCK).unwrap()
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let p = unsafe { std::alloc::alloc(Self::layout()) } as *mut T;
+        assert!(!p.is_null());
+        self.blocks.push(p);
+        self.cur = p;
+        self.end = unsafe { p.add(BLOCK) };
     }
     #[inline(always)]
     fn push(&mut self, x: T) {
-        if self.len % BLOCK == 0 {
-            self.blocks.push(Vec::with_capacity(BLOCK));
+        if self.cur == self.end {
+            self.grow();
         }
-        unsafe { self.blocks.last_mut().unwrap_unchecked().push(x) };
-        self.len += 1;
+        unsafe {
+            self.cur.write(x);
+            self.cur = self.cur.add(1);
+        }
     }
     pub fn len(&self) -> usize {
-        self.len
+        match self.blocks.last() {
+            None => 0,
+            Some(&p) => (self.blocks.len() - 1) * BLOCK + unsafe { self.cur.offset_from(p) } as usize,
+        }
     }
     pub fn blocks(&self) -> impl Iterator<Item = &[T]> {
-        self.blocks.iter().map(|b| &b[..])
+        let n = self.blocks.len();
+        self.blocks.iter().enumerate().map(move |(i, &p)| {
+            let l = if i + 1 == n { unsafe { self.cur.offset_from(p) as usize } } else { BLOCK };
+            unsafe { std::slice::from_raw_parts(p as *const T, l) }
+        })
     }
 }
 
-impl<T> std::ops::Index<usize> for BlockVec<T> {
+impl<T: Copy> Drop for BlockVec<T> {
+    fn drop(&mut self) {
+        for &p in &self.blocks {
+            unsafe { std::alloc::dealloc(p as *mut u8, Self::layout()) };
+        }
+    }
+}
+
+impl<T: Copy> std::ops::Index<usize> for BlockVec<T> {
     type Output = T;
     #[inline(always)]
     fn index(&self, i: usize) -> &T {
-        &self.blocks[i / BLOCK][i % BLOCK]
+        debug_assert!(i < self.len());
+        unsafe { &*self.blocks[i / BLOCK].add(i % BLOCK) }
     }
 }
 
-impl<T> std::ops::IndexMut<usize> for BlockVec<T> {
+impl<T: Copy> std::ops::IndexMut<usize> for BlockVec<T> {
     #[inline(always)]
     fn index_mut(&mut self, i: usize) -> &mut T {
-        &mut self.blocks[i / BLOCK][i % BLOCK]
+        debug_assert!(i < self.len());
+        unsafe { &mut *self.blocks[i / BLOCK].add(i % BLOCK) }
     }
 }
 
-fn buckets<T>() -> Vec<BlockVec<T>> {
+fn buckets<T: Copy>() -> Vec<BlockVec<T>> {
     (0..NB).map(|_| BlockVec::new()).collect()
 }
 
@@ -293,11 +336,27 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .clamp(1, 62);
     let reverse = std::env::var("REVERSE_FILES").is_ok_and(|v| v == "1");
+    // Queue readahead for every input file up front, so a cold page cache is read at full device depth.
+    {
+        let data = data.clone();
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            for d in ["links", "events", "clicks"] {
+                let Ok(rd) = std::fs::read_dir(data.join(d)) else { continue };
+                for e in rd.flatten() {
+                    if let Ok(f) = std::fs::File::open(e.path()) {
+                        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED) };
+                    }
+                }
+            }
+        });
+    }
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap();
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).unwrap();
     let we = parse_ts(json_str(&manifest, "window_end").as_bytes()).unwrap();
     let day0 = ws.div_euclid(DAY);
+    set_dates((ws - WEEK).div_euclid(DAY) - 2, we.div_euclid(DAY) + 7);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
 
     let mut prod_raw: Vec<(Vec<u8>, Vec<u8>)> = vec![];
@@ -328,11 +387,21 @@ fn main() {
     let ev_in = open_input(&data.join("events"), reverse);
     assert!(we - ws < u32::MAX as i64 && we - (ws - WEEK) < u32::MAX as i64, "window longer than 49 days");
     let tids = AtomicUsize::new(0);
-    let ev_parts: Vec<(Vec<BlockVec<Ev>>, Vec<u8>, usize, Vec<u64>)> = par_tasks(
+    // Valid copies get their person while parsing: the lookup is prefetched and resolved in
+    // batches of 32 lines, so its memory latency hides behind the parsing work.
+    let flush = |pend: &mut Vec<Ev>, bk: &mut Vec<BlockVec<Ev>>| {
+        for mut e in pend.drain(..) {
+            if e.ts != u32::MAX {
+                e.ukey = persons.get(e.ukey);
+            }
+            bk[bucket(e.ekey)].push(e);
+        }
+    };
+    let ev_parts: Vec<(Vec<BlockVec<Ev>>, usize, Vec<u64>, Vec<Ev>, Vec<u8>)> = par_tasks(
         ev_in.len(),
         threads,
-        || (buckets::<Ev>(), Vec::new(), tids.fetch_add(1, Relaxed), Vec::<u64>::new()),
-        |(bk, buf, tid, side), i| {
+        || (buckets::<Ev>(), tids.fetch_add(1, Relaxed), Vec::<u64>::new(), Vec::<Ev>::with_capacity(32), Vec::new()),
+        |(bk, tid, side, pend, buf), i| {
             scan::<7>(ev_in.read(i, buf), |f| {
                 if f.is_empty(0) {
                     return;
@@ -350,7 +419,7 @@ fn main() {
                         b"view" | b"cart" => {}
                         b"purchase" => {
                             let price = parse_price(f.get(6))?;
-                            let cat = products.get(f.get(5)).unwrap_or(unknown as u32);
+                            let cat = products.get_field(f, 5).unwrap_or(unknown as u32);
                             purchase = Some(price as u64 | (cat as u64) << 32);
                         }
                         _ => return None,
@@ -364,16 +433,21 @@ fn main() {
                     }
                     e.ts = (ts - ws) as u32;
                     e.ukey = f.key(1);
+                    persons.prefetch(e.ukey);
                     Some(())
                 })();
-                bk[bucket(ekey)].push(e);
+                pend.push(e);
+                if pend.len() == 32 {
+                    flush(pend, bk);
+                }
             });
+            flush(pend, bk);
         },
     );
     let mut sides: Vec<Vec<u64>> = (0..ev_parts.len()).map(|_| Vec::new()).collect();
     let ev_parts: Vec<Vec<BlockVec<Ev>>> = ev_parts
         .into_iter()
-        .map(|(b, _, tid, side)| {
+        .map(|(b, tid, side, _, _)| {
             sides[tid] = side;
             b
         })
@@ -391,28 +465,35 @@ fn main() {
     let pev_parts: Vec<Vec<BlockVec<PEv>>> = par_tasks(
         NB,
         threads,
-        || (buckets::<PEv>(), Vec::<u32>::new(), Vec::<u64>::new()),
+        || (buckets::<PEv>(), Vec::<u32>::new(), Vec::<std::mem::MaybeUninit<u64>>::new()),
         |(out, table, tkeys), b| {
             let parts = unsafe { ev_slots.get(b) };
             let n: usize = parts.iter().map(|p| p.len()).sum();
             let cap = (n * 2).next_power_of_two().max(16);
             table.clear();
             table.resize(cap, u32::MAX);
+            // Only slots whose table entry is set are ever read, so the keys stay uninitialized.
             tkeys.clear();
-            tkeys.resize(cap, 0);
+            tkeys.resize(cap, std::mem::MaybeUninit::uninit());
             let mask = cap - 1;
             for t in 0..parts.len() {
-                for i in 0..parts[t].len() {
+                let len = parts[t].len();
+                for i in 0..len {
+                    if i + 16 < len {
+                        let h2 = (mix(parts[t][i + 16].ekey) as usize >> 10) & mask;
+                        prefetch(table.as_ptr().wrapping_add(h2));
+                        prefetch(tkeys.as_ptr().wrapping_add(h2));
+                    }
                     let e = parts[t][i];
                     let mut h = (mix(e.ekey) as usize >> 10) & mask;
                     loop {
                         let s = table[h];
                         if s == u32::MAX {
                             table[h] = (t as u32) << 24 | i as u32;
-                            tkeys[h] = e.ekey;
+                            tkeys[h] = std::mem::MaybeUninit::new(e.ekey);
                             break;
                         }
-                        if tkeys[h] == e.ekey {
+                        if unsafe { tkeys[h].assume_init() } == e.ekey {
                             let (pt, pi) = ((s >> 24) as usize, (s & 0xFF_FFFF) as usize);
                             if e.ingest < parts[pt][pi].ingest {
                                 parts[pt][pi].ts = u32::MAX;
@@ -427,13 +508,9 @@ fn main() {
                 }
             }
             for p in parts.iter().flat_map(|p| p.blocks()) {
-                for (i, e) in p.iter().enumerate() {
-                    if let Some(f) = p.get(i + 32) {
-                        persons.prefetch(f.ukey);
-                    }
+                for e in p.iter() {
                     if e.ts != u32::MAX {
-                        let pk = persons.get(e.ukey);
-                        out[bucket(pk)].push(PEv { pkey: pk, ts: e.ts, pc: e.pc });
+                        out[bucket(e.ukey)].push(PEv { pkey: e.ukey, ts: e.ts, pc: e.pc });
                     }
                 }
             }
@@ -460,7 +537,7 @@ fn main() {
                     return;
                 }
                 let Some(ts) = f.ts(3).filter(|&t| t >= cws && t < we) else { return };
-                let Some(camp) = campaigns.get(f.get(2)) else { return };
+                let Some(camp) = campaigns.get_field(f, 2) else { return };
                 tmp.push(PCl { pkey: f.key(1), ckey: f.key(0), ts: (ts - cws) as u32, camp });
             });
             for j in 0..tmp.len() {

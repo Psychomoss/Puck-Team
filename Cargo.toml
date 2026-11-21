@@ -10,7 +10,7 @@ libc = "0.2.191"
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 memchr = "2.8.3"
 mimalloc = "0.1.52"
-parquet = { version = "60.1.0", default-features = false, features = ["arrow"] }
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
 rustc-hash = "2.1.3"
 
 [profile.release]

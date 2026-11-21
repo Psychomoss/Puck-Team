@@ -12,6 +12,12 @@ Team puck, Shopping Sessions, Rust. Read this and `git log` first when resuming.
 - Phase 3 (performance): done (see log; stopped after 7 consecutive <2% ideas). `scripts/bench.sh` = docker median of 3 (CPUS=8 MEM=24g) + verify.sh.
   `perf` is unavailable (perf_event_paranoid=2, no root), so profiling uses stage timers + micro-benchmarks.
 
+- Phase 5 (2026-11-21, after board score 1.29 s vs 0.64 s for the C++ entry mliao0128/fraun-shopping-sessions):
+  compared both on the laptop. The C++ entry is slower here (practice docker 1.9 s vs ours 1.2 s; CPU 9.1 s vs
+  5.9 s, RSS 3.6 GB vs 1.7 GB), so the board gap is environmental. The clearest difference was output size
+  (ours 80 MB uncompressed, theirs 22 MB Snappy): output is now zstd(1) with dictionaries on the
+  low-cardinality columns, 9.4 MB at practice. See the Phase 5 log below.
+
 ## How to check
 - `scripts/verify.sh` runs fixtures (36), dev compare vs `dev-answer/`, golden hashes on practice and final,
   plus 1-thread (`NCPU=1`) and reversed-file-order (`REVERSE_FILES=1`) runs. `QUICK=1` skips the last two,
@@ -94,3 +100,23 @@ Notes from experiments:
 - In-pipeline cost of the 1024-way event scatter at final: ~200 ms of 1020 ms parse (0.4 s sys page faults).
 - Remaining random person lookups cost ~230 ms at final (dedup ~190, clicks ~40), hidden mostly by prefetch.
 - Prefetch distance 8/16/32/64 for person lookups: within noise; using 32. purge_delay=-1: ~250 ms gain at final (less page faulting).
+
+## Phase 5 log (native, laptop; wall = whole process incl. exit, interleaved runs)
+| # | change | effect | kept |
+|---|---|---|---|
+| 14 | Parquet zstd(1), dictionary on day/sessions/events/top_category, plain user_id/revenue; one user file per thread | output practice 80 MB -> 9.4 MB, final 155 MB -> 28 MB; write +25 ms practice, ~0 at final (encoding-bound, not compression-bound) | yes |
+| 15 | posix_fadvise(WILLNEED) on all inputs from a background thread at start | neutral warm and cold on local NVMe; insurance for slow cold storage | yes |
+| 16 | F1/F2 timestamps: read-only date table (window -9 d .. +7 d, filled from the manifest) + SWAR HH:MM:SS; full parser as fallback | F1 16.9 -> 8.1 ns, mixed ts 17.3 -> 11.4 ns (P-core, L2-resident) | yes |
+| 17 | CSV scan as two passes: flatten comma/newline positions per 64 B block, then walk lines from the list (no serial line-to-line dependency) | 30 -> 22 ns/line on P-cores (E-cores 36 -> 45) | yes |
+| 18 | line-at-a-time scanner with one 96 B window per line | no gain (serial newline chain ~15 ns/line) | no |
+| 19 | person lookup moved into the parse loop, prefetched and resolved in batches of 32 lines | dedup 950 -> 540 ms CPU, parse +350 ms; net ~-40 ms wall practice | yes |
+| 20 | dedup hash: prefetch 16 records ahead, uninitialized key slots | dedup-hash 390 -> 350 ms CPU | yes |
+| 21 | valid copies straight to person buckets + event-id records with back-references, dedup only kills losers | 2048 write streams in parse: practice 836 -> 933 ms | no |
+| 22 | BlockVec as raw blocks with a write cursor (push = compare + store) | ~4% practice and final | yes |
+| 23 | campaign/product lookups via the SIMD packed key | small, within noise | yes |
+| 24 | mmap inputs (plain, MADV_POPULATE_READ, per-chunk MADV_DONTNEED) | -150 ms sys CPU in-process, but file-page teardown at exit (or per chunk) costs the same: wall equal to pread | no |
+
+Result (native wall, interleaved, median): practice 834 -> 779-803 ms, final 2421 -> 2377 ms (min 2413 -> 2297);
+total CPU practice 5.95 -> 5.35 s. Docker (laptop, incl. ~0.4 s container overhead): practice ~1.11 s, final ~2.7 s.
+Notes: in-process "total" hides exit cost (mmap teardown ~60 ms at practice); compare whole-process wall.
+
