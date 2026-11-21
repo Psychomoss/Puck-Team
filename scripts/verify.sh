@@ -32,8 +32,8 @@ for d in practice final; do
   echo "$d"
   run datasets/$d out_v_$d; check golden $d out_v_$d
   if [ "${QUICK:-0}" != 1 ] && [ "${DOCKER:-0}" != 1 ]; then
-    rm -rf out_v_$d; NCPU=1 DATA_DIR=datasets/$d OUTPUT_DIR=out_v_$d $BIN 2>/dev/null && check golden $d out_v_$d
-    rm -rf out_v_$d; REVERSE_FILES=1 DATA_DIR=datasets/$d OUTPUT_DIR=out_v_$d $BIN 2>/dev/null && check golden $d out_v_$d
+    rm -rf out_v_$d; NCPU=1 DATA_DIR=datasets/$d OUTPUT_DIR=out_v_$d $BIN 2>/dev/null; check golden $d out_v_$d
+    rm -rf out_v_$d; REVERSE_FILES=1 DATA_DIR=datasets/$d OUTPUT_DIR=out_v_$d $BIN 2>/dev/null; check golden $d out_v_$d
   fi
 done
 rm -rf out_v_dev out_v_practice out_v_final
