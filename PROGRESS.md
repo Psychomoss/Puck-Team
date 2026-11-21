@@ -59,6 +59,10 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | 4 | SIMD timestamps (F3: right-aligned 16-digit maddubs/madd; F1/F2: two 16-byte compares + shuffle), `Line` API keeping the chunk buffer so ID packing (6-bit, SSE) and F3 parsing read 16 bytes in-bounds without copies; differential tests vs scalar references | 1.21 s | 3.02 s | yes |
 | 5 | Parquet: no dictionary, no statistics, Int32 counts, rows split into equal 256K-row files written by the work-stealing pool; person stage: assists in a separate u32 campaign x day array (112 KB, L2-resident), credited counters 16 B, single pass for gap+revenue, skip category argmax without purchases | 1.10 s | 2.76 s | yes |
 | 6 | Compact records: events 40 -> 32 B (ts u32 relative to window start, u32::MAX = invalid; purchases as handles into per-thread price/category side tables), person-bucket events 24 -> 16 B, clicks 32 -> 24 B | 1.14 s | 2.82 s | yes (A/B native interleaved, 7 runs: final 2588 -> 2539 ms, practice 1048 -> 888 ms median; docker runs noisy) |
+| 7 | zero-initialized union-find arrays (parent = index+1, group min = max of !key) | - | links uf 85 -> 72 ms | yes |
+| 8 | dedup table as one array of (key, idx) 16 B slots | - | dedup 510 -> 590 ms | no |
+| 9 | dedup table with 8 B slots (32-bit fingerprint + idx) | - | no change | no |
+| 10 | L3-sized bitmap filter in front of the person table (skip DRAM lookup for IDs that need no remap; 61% of lookups hit linked IDs) | - | dedup 510 -> 610 ms (unpredictable branch; prefetch already hides latency) | no |
 
 Notes from experiments:
 - split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
@@ -77,4 +81,5 @@ Notes from experiments:
   (the generator always uses 14 days). Threads are clamped to 62 (purchase handles use 6 bits of thread id).
 - Laptop timing noise is large (thermal + background VM): docker final varied 2.70-2.97 s for one binary.
   `scripts/ab.sh BIN_A BIN_B DATASET RUNS` interleaves two native binaries; used for keep/revert decisions.
+- Docker no-op container with scorer flags: ~0.25 s fixed overhead on this laptop.
 - Prefetch distance 8/16/32/64 for person lookups: within noise; using 32. purge_delay=-1: ~250 ms gain at final (less page faulting).
