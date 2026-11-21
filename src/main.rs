@@ -1,6 +1,7 @@
 mod links;
 mod out;
 mod parse;
+mod person;
 
 use memchr::memchr;
 use memmap2::Mmap;
@@ -13,11 +14,9 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const CHUNK: usize = 1 << 20;
 const NB: usize = 1024;
-const ORGANIC: u32 = 0;
 
 /// Runs tasks 0..n on `threads` workers pulling from a shared counter; returns per-worker state.
 pub fn par_tasks<S: Send>(n: usize, threads: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) + Sync) -> Vec<S> {
@@ -141,27 +140,27 @@ struct Ev {
 }
 
 #[derive(Clone, Copy)]
-struct PEv {
-    pkey: u64,
-    ts: i64,
-    price: u32,
-    cat: u32,
+pub struct PEv {
+    pub pkey: u64,
+    pub ts: i64,
+    pub price: u32,
+    pub cat: u32,
 }
 
 #[derive(Clone, Copy)]
-struct PCl {
-    pkey: u64,
-    ckey: u64,
-    ts: i64,
-    camp: u32,
+pub struct PCl {
+    pub pkey: u64,
+    pub ckey: u64,
+    pub ts: i64,
+    pub camp: u32,
 }
 
 #[derive(Clone, Copy, Default)]
-struct CampDay {
-    sessions: u64,
-    purchasing: u64,
-    revenue: u64,
-    assisted: u64,
+pub struct CampDay {
+    pub sessions: u64,
+    pub purchasing: u64,
+    pub revenue: u64,
+    pub assisted: u64,
 }
 
 pub struct UserRow {
@@ -197,62 +196,6 @@ fn json_str(text: &str, name: &str) -> String {
 
 fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
     (0..NB).map(|_| Vec::with_capacity(cap)).collect()
-}
-
-/// Groups `items` by person (keys -> dense ids via a small open-addressing table), stable within a person.
-fn group_by<T: Copy>(items: impl Iterator<Item = T> + Clone, pk: impl Fn(&T) -> u64, n: usize, ids: &mut PersonIds) -> (Vec<T>, Vec<u32>) {
-    let idx: Vec<u32> = items.clone().map(|it| ids.get(pk(&it))).collect();
-    let mut counts = vec![0u32; ids.keys.len() + 1];
-    for &id in &idx {
-        counts[id as usize] += 1;
-    }
-    let mut start = vec![0u32; counts.len() + 1];
-    for i in 0..counts.len() {
-        start[i + 1] = start[i] + counts[i];
-    }
-    let mut pos = start.clone();
-    let mut out: Vec<T> = Vec::with_capacity(n);
-    let o = out.spare_capacity_mut();
-    for (it, &id) in items.zip(idx.iter()) {
-        o[pos[id as usize] as usize].write(it);
-        pos[id as usize] += 1;
-    }
-    unsafe { out.set_len(n) };
-    (out, start)
-}
-
-/// Dense ids for person keys of one bucket; id == keys.len() means "absent" (lookup-only mode).
-struct PersonIds {
-    keys: Vec<u64>,
-    table: Vec<u32>,
-    mask: usize,
-    insert: bool,
-}
-
-impl PersonIds {
-    fn new(n: usize) -> Self {
-        let cap = (n * 2).next_power_of_two().max(16);
-        PersonIds { keys: Vec::new(), table: vec![u32::MAX; cap], mask: cap - 1, insert: true }
-    }
-    #[inline]
-    fn get(&mut self, k: u64) -> u32 {
-        let mut h = (mix(k) as usize) & self.mask;
-        loop {
-            let t = self.table[h];
-            if t == u32::MAX {
-                if !self.insert {
-                    return self.keys.len() as u32;
-                }
-                self.table[h] = self.keys.len() as u32;
-                self.keys.push(k);
-                return self.table[h];
-            }
-            if self.keys[t as usize] == k {
-                return t;
-            }
-            h = (h + 1) & self.mask;
-        }
-    }
 }
 
 fn main() {
@@ -416,106 +359,55 @@ fn main() {
     let pcl_parts: Vec<Vec<Vec<PCl>>> = par_tasks(
         cl_in.len(),
         threads,
-        || buckets::<PCl>(est),
-        |bk, i| {
+        || (buckets::<PCl>(est), Vec::<PCl>::new()),
+        |(bk, tmp), i| {
+            tmp.clear();
             scan::<4>(cl_in.chunk(i), |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
                 let Some(ts) = parse_ts(f[3]).filter(|&t| t >= cws && t < we) else { return };
                 let Some(camp) = campaigns.get(f[2]) else { return };
-                let p = persons.get(key(f[1]));
-                bk[bucket(p)].push(PCl { pkey: p, ckey: key(f[0]), ts, camp });
+                tmp.push(PCl { pkey: key(f[1]), ckey: key(f[0]), ts, camp });
             });
+            for j in 0..tmp.len() {
+                if let Some(n) = tmp.get(j + 16) {
+                    persons.prefetch(n.pkey);
+                }
+                let mut c = tmp[j];
+                c.pkey = persons.get(c.pkey);
+                bk[bucket(c.pkey)].push(c);
+            }
         },
-    );
+    )
+    .into_iter()
+    .map(|x| x.0)
+    .collect();
     tm.lap("clicks");
 
-    // Per person bucket: group, sessionize, credit, assists, aggregate.
+    // Per person bucket: sort by (person, ts), sessionize, credit, assists, aggregate.
     let mut order: Vec<usize> = (0..NB).collect();
     order.sort_by_key(|&b| std::cmp::Reverse(pev_parts.iter().map(|t| t[b].len()).sum::<usize>()));
     let ncat = cats.len();
-    let results: Vec<(Vec<UserRow>, Vec<CampDay>)> = par_tasks(
+    let bits = |v: i64| 64 - (v.max(1) as u64 - 1).leading_zeros();
+    let ctx = person::Ctx { ws, cws, day0, ndays, ev_bits: bits(we - ws), cl_bits: bits(we - cws) };
+    assert!(ctx.cl_bits <= 40, "window too long");
+    let results: Vec<(Vec<UserRow>, Vec<CampDay>, person::Scratch)> = par_tasks(
         NB,
         threads,
-        || (Vec::new(), vec![CampDay::default(); ncamp * ndays]),
-        |(rows, cd), oi| {
+        || (Vec::new(), vec![CampDay::default(); ncamp * ndays], person::Scratch::default()),
+        |(rows, cd, scratch), oi| {
             let b = order[oi];
-            let n: usize = pev_parts.iter().map(|t| t[b].len()).sum();
-            if n == 0 {
-                return;
-            }
-            let mut ids = PersonIds::new(n);
-            let (mut evs, es) = group_by(pev_parts.iter().flat_map(|t| t[b].iter().copied()), |e| e.pkey, n, &mut ids);
-            ids.insert = false;
-            let nc: usize = pcl_parts.iter().map(|t| t[b].len()).sum();
-            let (mut cls, cs) = group_by(pcl_parts.iter().flat_map(|t| t[b].iter().copied()), |c| c.pkey, nc, &mut ids);
-            let mut stamp = vec![u32::MAX; ncamp];
-            let mut sid: u32 = 0;
-            let mut catsum = vec![0u64; ncat];
-            for p in 0..ids.keys.len() {
-                let pk = ids.keys[p];
-                let ev = &mut evs[es[p] as usize..es[p + 1] as usize];
-                ev.sort_unstable_by_key(|e| e.ts);
-                let cl = &mut cls[cs[p] as usize..cs[p + 1] as usize];
-                cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(b.ckey, a.ckey)));
-                let (mut lo, mut hi) = (0, 0);
-                let mut cur: Option<UserRow> = None;
-                let mut s = 0;
-                while s < ev.len() {
-                    let start = ev[s].ts;
-                    let mut j = s + 1;
-                    while j < ev.len() && ev[j].ts - ev[j - 1].ts <= GAP {
-                        j += 1;
-                    }
-                    let day = start.div_euclid(DAY);
-                    let di = (day - day0) as usize;
-                    let mut rev = 0u64;
-                    for e in &ev[s..j] {
-                        rev += e.price as u64;
-                    }
-                    while hi < cl.len() && cl[hi].ts <= start {
-                        hi += 1;
-                    }
-                    while lo < hi && cl[lo].ts < start - WEEK {
-                        lo += 1;
-                    }
-                    let camp = if hi > lo { cl[hi - 1].camp } else { ORGANIC };
-                    let c = &mut cd[camp as usize * ndays + di];
-                    c.sessions += 1;
-                    c.revenue += rev;
-                    c.purchasing += (rev > 0) as u64;
-                    for k in &cl[lo..hi] {
-                        if stamp[k.camp as usize] != sid {
-                            stamp[k.camp as usize] = sid;
-                            cd[k.camp as usize * ndays + di].assisted += 1;
-                        }
-                    }
-                    sid += 1;
-                    let day = day as i32;
-                    if cur.as_ref().is_some_and(|r| r.day != day) {
-                        rows.push(finish(cur.take().unwrap(), &mut catsum));
-                    }
-                    if rev > 0 {
-                        for e in &ev[s..j] {
-                            catsum[e.cat as usize] += e.price as u64;
-                        }
-                    }
-                    let r = cur.get_or_insert(UserRow { pkey: pk, day, sessions: 0, events: 0, revenue: 0, top: u32::MAX });
-                    r.sessions += 1;
-                    r.events += (j - s) as u32;
-                    r.revenue += rev;
-                    s = j;
-                }
-                rows.push(finish(cur.take().unwrap(), &mut catsum));
-            }
+            let evs: Vec<&[PEv]> = pev_parts.iter().map(|t| &t[b][..]).collect();
+            let cls: Vec<&[PCl]> = pcl_parts.iter().map(|t| &t[b][..]).collect();
+            person::process(&ctx, &evs, &cls, scratch, ncamp, ncat, rows, cd);
         },
     );
     tm.lap("sessions");
 
     let mut cd = vec![CampDay::default(); ncamp * ndays];
     let mut rows: Vec<Vec<UserRow>> = vec![];
-    for (r, c) in results {
+    for (r, c, _) in results {
         for (a, b) in cd.iter_mut().zip(c) {
             a.sessions += b.sessions;
             a.purchasing += b.purchasing;
@@ -537,16 +429,4 @@ fn main() {
     tm.lap("write");
     eprintln!("{:>12}: {:8.1} ms", "total", t0.elapsed().as_secs_f64() * 1e3);
     std::process::exit(0);
-}
-
-fn finish(mut r: UserRow, catsum: &mut [u64]) -> UserRow {
-    let mut best = 0;
-    for (i, x) in catsum.iter_mut().enumerate() {
-        if *x > best {
-            best = *x;
-            r.top = i as u32;
-        }
-        *x = 0;
-    }
-    r
 }

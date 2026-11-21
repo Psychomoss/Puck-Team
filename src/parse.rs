@@ -45,33 +45,28 @@ fn masks(data: &[u8], base: usize) -> (u64, u64, u64) {
 #[inline(always)]
 pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
     let len = data.len();
-    let mut line_start = 0usize;
+    let mut ls = 0usize;
     let mut nf = 0usize;
-    let mut ends = [0usize; N];
+    let mut ends = [0usize; 8];
     let mut quotes = 0u32;
     let mut base = 0usize;
-    let mut emit = |ls: usize, le: usize, ends: &[usize; N], q: u32| {
+    // Branch-free field splitting: which fields are quoted is random, so branches would mispredict.
+    let mut emit = |ls: usize, ends: &[usize; 8], mut q: u32| {
         let mut fl = [&b""[..]; N];
         let mut s = ls;
         for i in 0..N {
-            let e = if i + 1 < N { ends[i] } else { le };
-            fl[i] = unsafe { data.get_unchecked(s..e) };
+            let e = ends[i];
+            let l = e - s;
+            let first = *data.get(s).unwrap_or(&0);
+            let last = *data.get(e.wrapping_sub(1)).unwrap_or(&0);
+            let st = ((first == b'"') & (last == b'"') & (l >= 2)) as usize;
+            q = q.wrapping_sub(2 * st as u32);
+            fl[i] = unsafe { data.get_unchecked(s + st..e - st) };
             s = e + 1;
         }
-        if q != 0 {
-            let mut q = q;
-            for x in fl.iter_mut() {
-                let l = x.len();
-                if l >= 2 && x[0] == b'"' && x[l - 1] == b'"' {
-                    *x = &x[1..l - 1];
-                    q = q.wrapping_sub(2);
-                }
-            }
-            if q != 0 {
-                return;
-            }
+        if q == 0 {
+            f(&fl);
         }
-        f(&fl);
     };
     while base < len {
         let (nl, cm, qt) = masks(data, base);
@@ -79,21 +74,17 @@ pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
         let mut qb = qt;
         while bits != 0 {
             let tz = bits.trailing_zeros();
-            let bit = 1u64 << tz;
             let pos = base + tz as usize;
-            if cm & bit != 0 {
-                if nf < N - 1 {
-                    ends[nf] = pos;
-                }
-                nf += 1;
-            } else {
-                let below = bit - 1;
+            ends[nf & 7] = pos;
+            nf += 1;
+            if (nl >> tz) & 1 != 0 {
+                let below = (1u64 << tz) - 1;
                 let q = quotes + (qb & below).count_ones();
                 qb &= !below;
-                if nf == N - 1 {
-                    emit(line_start, pos, &ends, q);
+                if nf == N {
+                    emit(ls, &ends, q);
                 }
-                line_start = pos + 1;
+                ls = pos + 1;
                 nf = 0;
                 quotes = 0;
             }
@@ -102,8 +93,9 @@ pub fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
         quotes += qb.count_ones();
         base += 64;
     }
-    if line_start < len && nf == N - 1 {
-        emit(line_start, len, &ends, quotes);
+    if ls < len && nf == N - 1 {
+        ends[N - 1] = len;
+        emit(ls, &ends, quotes);
     }
 }
 

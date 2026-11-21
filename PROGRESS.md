@@ -54,7 +54,11 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | 0 | v1 baseline | 2.54 s | 7.48 s | - |
 | 1 | AVX2 64-byte-block scanner (bitmasks for `\n` `,` `"`; quote validity by quote count), 6-bit order-preserving u64 ID keys (interner fallback), 40 B event records, NB=1024 buckets, lock-free link hash table + CAS union-find + atomic fetch_min names, counting-sort grouping per person bucket, prefetched person lookups, mimalloc purge_delay=-1 | 1.68 s | 4.07 s | yes |
 
+| 2 | branch-free quote stripping in scanner (46 -> 30 ns/line), batched+prefetched click person lookups, person stage rewritten: LSD radix sort on packed (person id, ts) 16 B records, click ties resolved at credit time, assists via per-campaign interval union (O(clicks) instead of O(sessions x window clicks)) | 1.32 s | 3.28 s | yes |
+
 Notes from experiments:
 - split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
 - Person lookup in the global table cost ~500 ms of dedup at final (128 MB table, random DRAM); prefetch 16 ahead cut it to ~250 ms.
-- mimalloc large OS pages / eager commit: no gain. purge_delay=-1: ~250 ms gain at final (less page faulting).
+- mimalloc large OS pages / eager commit: no gain.
+- Old person stage at final: per-person comparison sorts ~2.0 thread-s, assists loop ~1.1 thread-s.
+- Limitation: window (+7 days) must be < 2^40 ms (34 years) for the packed sort key; asserted at startup. purge_delay=-1: ~250 ms gain at final (less page faulting).
