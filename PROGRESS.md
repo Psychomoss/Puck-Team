@@ -7,7 +7,8 @@ Team puck, Shopping Sessions, Rust. Read this and `git log` first when resuming.
 - Phase 1 (correct Rust pipeline): done. Gate 1 passed.
 - Phase 2 (Docker): done. Multi-stage (rust:1.95-slim-bookworm -> debian:bookworm-slim, needs `chmod` for
   docker_run.sh cleanup), mimalloc, fat LTO, x86-64-v3. Docker: fixtures 36/36, dev MATCH (0.53 s wall incl. container start).
-- Next: Phase 3 (performance).
+- Phase 3 (performance): in progress. `scripts/bench.sh` = docker median of 3 (CPUS=8 MEM=24g) + verify.sh.
+  `perf` is unavailable (perf_event_paranoid=2, no root), so profiling uses stage timers + micro-benchmarks.
 
 ## How to check
 - `scripts/verify.sh` runs fixtures (36), dev compare vs `dev-answer/`, golden hashes on practice and final,
@@ -46,3 +47,14 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | dev | 0.27 s |
 | practice | 3.9 s |
 | final | 9.8 s (maxrss 12.5 GB) |
+
+## Phase 3 log (Docker medians, laptop; practice / final)
+| # | change | practice | final | kept |
+|---|---|---|---|---|
+| 0 | v1 baseline | 2.54 s | 7.48 s | - |
+| 1 | AVX2 64-byte-block scanner (bitmasks for `\n` `,` `"`; quote validity by quote count), 6-bit order-preserving u64 ID keys (interner fallback), 40 B event records, NB=1024 buckets, lock-free link hash table + CAS union-find + atomic fetch_min names, counting-sort grouping per person bucket, prefetched person lookups, mimalloc purge_delay=-1 | 1.68 s | 4.07 s | yes |
+
+Notes from experiments:
+- split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
+- Person lookup in the global table cost ~500 ms of dedup at final (128 MB table, random DRAM); prefetch 16 ahead cut it to ~250 ms.
+- mimalloc large OS pages / eager commit: no gain. purge_delay=-1: ~250 ms gain at final (less page faulting).

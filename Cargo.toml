@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 arrow-array = "60.1.0"
 arrow-schema = "60.1.0"
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 mimalloc = "0.1.52"

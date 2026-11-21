@@ -30,7 +30,6 @@ pub fn write_all(
     cats: &[Vec<u8>],
     camps: &[(Vec<u8>, Vec<u8>)],
     camp_rows: &[(usize, i32, u64, u64, u64, u64)],
-    _threads: usize,
 ) {
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
@@ -43,7 +42,7 @@ pub fn write_all(
                 let names: Vec<Vec<u8>> = part.iter().map(|r| key_bytes(r.pkey)).collect();
                 let user = StringArray::from_iter_values(names.iter().map(|n| s(n)));
                 let top = StringArray::from_iter(
-                    part.iter().map(|r| (r.top != u16::MAX).then(|| s(&cats[r.top as usize]))),
+                    part.iter().map(|r| (r.top != u32::MAX).then(|| s(&cats[r.top as usize]))),
                 );
                 write(
                     &ud.join(format!("part-{i:05}.parquet")),
