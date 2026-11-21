@@ -55,10 +55,14 @@ Also in `scripts/golden.sha256` (used by verify.sh).
 | 1 | AVX2 64-byte-block scanner (bitmasks for `\n` `,` `"`; quote validity by quote count), 6-bit order-preserving u64 ID keys (interner fallback), 40 B event records, NB=1024 buckets, lock-free link hash table + CAS union-find + atomic fetch_min names, counting-sort grouping per person bucket, prefetched person lookups, mimalloc purge_delay=-1 | 1.68 s | 4.07 s | yes |
 
 | 2 | branch-free quote stripping in scanner (46 -> 30 ns/line), batched+prefetched click person lookups, person stage rewritten: LSD radix sort on packed (person id, ts) 16 B records, click ties resolved at credit time, assists via per-campaign interval union (O(clicks) instead of O(sessions x window clicks)) | 1.32 s | 3.28 s | yes |
+| 3 | pread into per-thread buffers instead of mmap; append-only block lists (1024-record blocks) for all bucket stores instead of over-reserved Vecs; per-stage user/sys CPU in timings. Peak RSS final 15 GB -> 5.7 GB | 1.24 s | 3.22 s | yes |
 
 Notes from experiments:
 - split() was 138 ns/line (79% of lines contain a quote); new scanner 45 ns/line, full field parse ~105 ns/line (P-core).
 - Person lookup in the global table cost ~500 ms of dedup at final (128 MB table, random DRAM); prefetch 16 ahead cut it to ~250 ms.
 - mimalloc large OS pages / eager commit: no gain.
 - Old person stage at final: per-person comparison sorts ~2.0 thread-s, assists loop ~1.1 thread-s.
+- THP is active by default (mimalloc madvise): disabling it (prctl) made final 0.6 s slower.
+- Over-reserved bucket Vecs (2x estimate) made THP zero ~6 GB instead of 2.5 GB (sys 3.1 s); no reserve: sys 1.6 s but realloc copies; block lists: best of both.
+- pread vs mmap: same speed; pread kept (no page-table teardown, no RSS from file pages).
 - Limitation: window (+7 days) must be < 2^40 ms (34 years) for the packed sort key; asserted at startup. purge_delay=-1: ~250 ms gain at final (less page faulting).

@@ -4,7 +4,6 @@ mod parse;
 mod person;
 
 use memchr::memchr;
-use memmap2::Mmap;
 use parse::*;
 use std::cell::UnsafeCell;
 use std::path::{Path, PathBuf};
@@ -64,62 +63,91 @@ impl<T> Slots<T> {
 }
 
 pub struct Input {
-    maps: Vec<Mmap>,
+    files: Vec<(std::fs::File, usize)>,
     chunks: Vec<(usize, usize, usize)>,
     pub bytes: usize,
 }
 
 impl Input {
-    pub fn chunk(&self, i: usize) -> &[u8] {
-        let (f, a, b) = self.chunks[i];
-        &self.maps[f][a..b]
-    }
     pub fn len(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Reads chunk i into `buf` and returns the lines that start in its byte range (the first
+    /// line of each file, the header, is skipped).
+    pub fn read<'a>(&self, i: usize, buf: &'a mut Vec<u8>) -> &'a [u8] {
+        use std::os::unix::fs::FileExt;
+        let (fi, a, b) = self.chunks[i];
+        let (file, len) = &self.files[fi];
+        let start = a.saturating_sub(1);
+        let mut end = (b + 4096).min(*len);
+        buf.resize(end - start, 0);
+        file.read_exact_at(buf, start as u64).unwrap();
+        let grow = |buf: &mut Vec<u8>, end: &mut usize| {
+            let new_end = (*end + (*end - start)).min(*len);
+            let old = buf.len();
+            buf.resize(new_end - start, 0);
+            file.read_exact_at(&mut buf[old..], *end as u64).unwrap();
+            *end = new_end;
+        };
+        // First line start at or after a (after the header in the file's first chunk).
+        let first = loop {
+            let from = if a == 0 { 0 } else { 1 };
+            if a > 0 && buf[0] == b'\n' {
+                break 1;
+            }
+            match memchr(b'\n', &buf[from.min(buf.len())..]) {
+                Some(p) => break from + p + 1,
+                None if end < *len => grow(buf, &mut end),
+                None => return &[],
+            }
+        };
+        if start + first >= b {
+            return &[];
+        }
+        // Last line starting before b ends at the first newline at or after b - 1.
+        let last = loop {
+            match memchr(b'\n', &buf[b - 1 - start..]) {
+                Some(p) => break b - start + p,
+                None if end < *len => grow(buf, &mut end),
+                None => break buf.len(),
+            }
+        };
+        &buf[first..last]
     }
 }
 
 fn open_input(dir: &Path, reverse: bool) -> Input {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.extension().is_some_and(|x| x == "csv") && p.is_file())
                 .collect()
         })
         .unwrap_or_default();
-    files.sort();
+    paths.sort();
     if reverse {
-        files.reverse();
+        paths.reverse();
     }
-    let mut maps = vec![];
+    let mut files = vec![];
     let mut chunks = vec![];
     let mut bytes = 0;
-    for p in files {
+    for p in paths {
         let file = std::fs::File::open(&p).unwrap();
-        if file.metadata().unwrap().len() == 0 {
+        let len = file.metadata().unwrap().len() as usize;
+        if len == 0 {
             continue;
         }
-        let m = unsafe { Mmap::map(&file).unwrap() };
-        let fi = maps.len();
-        if let Some(h) = memchr(b'\n', &m) {
-            let mut a = h + 1;
-            bytes += m.len() - a;
-            while a < m.len() {
-                let mut b = (a + CHUNK).min(m.len());
-                if b < m.len() {
-                    b = memchr(b'\n', &m[b..]).map_or(m.len(), |o| b + o + 1);
-                }
-                chunks.push((fi, a, b));
-                a = b;
-            }
+        bytes += len;
+        for a in (0..len).step_by(CHUNK) {
+            chunks.push((files.len(), a, (a + CHUNK).min(len)));
         }
-        maps.push(m);
+        files.push((file, len));
     }
-    // Largest-first is not needed: chunks are equal-sized; interleave files only when reversing.
     if reverse {
         chunks.reverse();
     }
-    Input { maps, chunks, bytes }
+    Input { files, chunks, bytes }
 }
 
 fn read_small_csv<const N: usize>(path: &Path, mut f: impl FnMut(&[&[u8]; N])) {
@@ -172,12 +200,23 @@ pub struct UserRow {
     pub top: u32,
 }
 
-struct Timer(Instant);
+pub struct Timer(Instant, f64, f64);
+fn cpu_times() -> (f64, f64) {
+    let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+    let t = |v: libc::timeval| v.tv_sec as f64 * 1e3 + v.tv_usec as f64 / 1e3;
+    (t(r.ru_utime), t(r.ru_stime))
+}
 impl Timer {
-    fn lap(&mut self, what: &str) {
+    fn new() -> Self {
+        let (u, s) = cpu_times();
+        Timer(Instant::now(), u, s)
+    }
+    pub fn lap(&mut self, what: &str) {
         let now = Instant::now();
-        eprintln!("{what:>12}: {:8.1} ms", (now - self.0).as_secs_f64() * 1e3);
-        self.0 = now;
+        let (u, s) = cpu_times();
+        eprintln!("{what:>12}: {:8.1} ms   (cpu user {:7.0} sys {:6.0})", (now - self.0).as_secs_f64() * 1e3, u - self.1, s - self.2);
+        *self = Timer(now, u, s);
     }
 }
 
@@ -194,15 +233,58 @@ fn json_str(text: &str, name: &str) -> String {
     rest[a..b].to_string()
 }
 
-fn buckets<T>(cap: usize) -> Vec<Vec<T>> {
-    (0..NB).map(|_| Vec::with_capacity(cap)).collect()
+/// Append-only list of fixed-size blocks: no reallocation copies and no large untouched reservations.
+pub struct BlockVec<T> {
+    blocks: Vec<Vec<T>>,
+    len: usize,
+}
+
+const BLOCK: usize = 1024;
+
+impl<T> BlockVec<T> {
+    fn new() -> Self {
+        BlockVec { blocks: Vec::new(), len: 0 }
+    }
+    #[inline(always)]
+    fn push(&mut self, x: T) {
+        if self.len % BLOCK == 0 {
+            self.blocks.push(Vec::with_capacity(BLOCK));
+        }
+        unsafe { self.blocks.last_mut().unwrap_unchecked().push(x) };
+        self.len += 1;
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn blocks(&self) -> impl Iterator<Item = &[T]> {
+        self.blocks.iter().map(|b| &b[..])
+    }
+}
+
+impl<T> std::ops::Index<usize> for BlockVec<T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &T {
+        &self.blocks[i / BLOCK][i % BLOCK]
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for BlockVec<T> {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        &mut self.blocks[i / BLOCK][i % BLOCK]
+    }
+}
+
+fn buckets<T>() -> Vec<BlockVec<T>> {
+    (0..NB).map(|_| BlockVec::new()).collect()
 }
 
 fn main() {
     let t0 = Instant::now();
     // mi_option_purge_delay = -1: keep freed pages for reuse instead of returning them to the OS.
     unsafe { libmimalloc_sys::mi_option_set(15, -1) };
-    let mut tm = Timer(t0);
+    let mut tm = Timer::new();
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let outdir = PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -245,13 +327,12 @@ fn main() {
 
     // Events: parse, validate each copy, bucket by event_id.
     let ev_in = open_input(&data.join("events"), reverse);
-    let est = ev_in.bytes / 60 / NB / threads * 2 + 16;
-    let ev_parts: Vec<Vec<Vec<Ev>>> = par_tasks(
+    let ev_parts: Vec<Vec<BlockVec<Ev>>> = par_tasks(
         ev_in.len(),
         threads,
-        || buckets::<Ev>(est),
-        |bk, i| {
-            scan::<7>(ev_in.chunk(i), |f| {
+        || (buckets::<Ev>(), Vec::new()),
+        |(bk, buf), i| {
+            scan::<7>(ev_in.read(i, buf), |f| {
                 if f[0].is_empty() {
                     return;
                 }
@@ -282,22 +363,24 @@ fn main() {
                 bk[bucket(ekey)].push(e);
             });
         },
-    );
+    )
+    .into_iter()
+    .map(|x| x.0)
+    .collect();
     tm.lap("events parse");
 
     // Dedup per bucket (smallest ingest_ts wins), keep valid survivors, re-bucket by person.
-    let mut by_bucket: Vec<Vec<Vec<Ev>>> = (0..NB).map(|_| Vec::with_capacity(ev_parts.len())).collect();
+    let mut by_bucket: Vec<Vec<BlockVec<Ev>>> = (0..NB).map(|_| Vec::with_capacity(ev_parts.len())).collect();
     for t in ev_parts {
         for (b, v) in t.into_iter().enumerate() {
             by_bucket[b].push(v);
         }
     }
     let ev_slots = Slots::new(by_bucket);
-    let est = ev_in.bytes / 64 / NB / threads * 2 + 16;
-    let pev_parts: Vec<Vec<Vec<PEv>>> = par_tasks(
+    let pev_parts: Vec<Vec<BlockVec<PEv>>> = par_tasks(
         NB,
         threads,
-        || (buckets::<PEv>(est), Vec::<u32>::new(), Vec::<u64>::new()),
+        || (buckets::<PEv>(), Vec::<u32>::new(), Vec::<u64>::new()),
         |(out, table, tkeys), b| {
             let parts = unsafe { ev_slots.get(b) };
             let n: usize = parts.iter().map(|p| p.len()).sum();
@@ -332,7 +415,7 @@ fn main() {
                     }
                 }
             }
-            for p in parts.iter() {
+            for p in parts.iter().flat_map(|p| p.blocks()) {
                 for (i, e) in p.iter().enumerate() {
                     if let Some(f) = p.get(i + 16) {
                         persons.prefetch(f.ukey);
@@ -355,14 +438,13 @@ fn main() {
     // Clicks: duplicates are identical, so they change neither credit nor assists; no dedup needed.
     let cl_in = open_input(&data.join("clicks"), reverse);
     let cws = ws - WEEK;
-    let est = cl_in.bytes / 40 / NB / threads * 2 + 16;
-    let pcl_parts: Vec<Vec<Vec<PCl>>> = par_tasks(
+    let pcl_parts: Vec<Vec<BlockVec<PCl>>> = par_tasks(
         cl_in.len(),
         threads,
-        || (buckets::<PCl>(est), Vec::<PCl>::new()),
-        |(bk, tmp), i| {
+        || (buckets::<PCl>(), Vec::<PCl>::new(), Vec::new()),
+        |(bk, tmp, buf), i| {
             tmp.clear();
-            scan::<4>(cl_in.chunk(i), |f| {
+            scan::<4>(cl_in.read(i, buf), |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
@@ -398,8 +480,8 @@ fn main() {
         || (Vec::new(), vec![CampDay::default(); ncamp * ndays], person::Scratch::default()),
         |(rows, cd, scratch), oi| {
             let b = order[oi];
-            let evs: Vec<&[PEv]> = pev_parts.iter().map(|t| &t[b][..]).collect();
-            let cls: Vec<&[PCl]> = pcl_parts.iter().map(|t| &t[b][..]).collect();
+            let evs: Vec<&[PEv]> = pev_parts.iter().flat_map(|t| t[b].blocks()).collect();
+            let cls: Vec<&[PCl]> = pcl_parts.iter().flat_map(|t| t[b].blocks()).collect();
             person::process(&ctx, &evs, &cls, scratch, ncamp, ncat, rows, cd);
         },
     );

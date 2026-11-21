@@ -62,13 +62,16 @@ fn find(p: &[AtomicU32], mut x: u32) -> u32 {
 const STEP: usize = 1 << 16;
 
 pub fn build(input: &Input, threads: usize, tm: &mut Timer) -> Persons {
-    let pairs: Vec<Vec<[u64; 2]>> = par_tasks(input.len(), threads, Vec::new, |v, i| {
-        scan::<2>(input.chunk(i), |f| {
+    let pairs: Vec<Vec<[u64; 2]>> = par_tasks(input.len(), threads, || (Vec::new(), Vec::new()), |(v, buf), i| {
+        scan::<2>(input.read(i, buf), |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
                 v.push([key(f[0]), key(f[1])]);
             }
         });
-    });
+    })
+    .into_iter()
+    .map(|x| x.0)
+    .collect();
     let sides: usize = pairs.iter().map(|v| v.len() * 2).sum();
     let cap = (sides * 3 / 2).next_power_of_two().max(16);
     let mask = cap - 1;
